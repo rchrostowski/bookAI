@@ -1,75 +1,152 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
-CATEGORIES: Dict[str, Dict[str, int]] = {
+
+# -------------------------
+# Category keyword rules
+# -------------------------
+
+CATEGORY_RULES: Dict[str, Dict[str, List[str]]] = {
     "Fuel": {
-        "exxon": 3, "shell": 3, "chevron": 3, "bp": 3, "sunoco": 3,
-        "gas": 2, "diesel": 2, "fuel": 2, "station": 1
-    },
-    "Tools & Equipment": {
-        "harbor freight": 4, "tool": 2, "drill": 2, "saw": 2, "dewalt": 2, "milwaukee": 2,
-        "equipment": 2, "hardware": 1
-    },
-    "Materials / Supplies": {
-        "home depot": 4, "lowe": 4, "lumber": 2, "mulch": 2, "concrete": 2, "pipe": 2,
-        "paint": 2, "supply": 1, "materials": 2
-    },
-    "Vehicle Maintenance": {
-        "autozone": 4, "advance auto": 4, "jiffy lube": 4, "oil": 2, "tire": 2,
-        "brake": 2, "battery": 2, "maintenance": 1, "alignment": 2
+        "vendor": [
+            "shell", "exxon", "bp", "chevron", "sunoco", "mobil",
+            "citgo", "wawa", "speedway", "marathon"
+        ],
+        "text": [
+            "fuel", "gas", "unleaded", "diesel", "pump", "gallon"
+        ],
     },
     "Meals": {
-        "restaurant": 2, "grill": 1, "cafe": 1, "mcdonald": 2, "chipotle": 2, "starbucks": 2,
-        "meal": 2, "dinner": 1, "lunch": 1
+        "vendor": [
+            "starbucks", "dunkin", "coffee", "cafe", "grill",
+            "restaurant", "bistro", "kitchen", "bar", "pizza"
+        ],
+        "text": [
+            "coffee", "latte", "espresso", "bagel", "sandwich",
+            "burger", "fries", "meal", "food", "drink", "soda"
+        ],
+    },
+    "Materials / Supplies": {
+        "vendor": [
+            "home depot", "lowe", "ace hardware", "menards"
+        ],
+        "text": [
+            "lumber", "mulch", "concrete", "pipe", "paint",
+            "supply", "supplies", "hardware", "materials"
+        ],
+    },
+    "Tools & Equipment": {
+        "vendor": [
+            "harbor freight", "grainger", "fastenal"
+        ],
+        "text": [
+            "tool", "drill", "saw", "equipment", "ladder",
+            "compressor", "generator"
+        ],
+    },
+    "Vehicle Maintenance": {
+        "vendor": [
+            "autozone", "advanced auto", "jiffy lube", "pep boys"
+        ],
+        "text": [
+            "oil change", "tire", "brake", "alignment",
+            "maintenance", "service"
+        ],
     },
     "Office / Admin": {
-        "staples": 4, "office": 2, "paper": 1, "printer": 2, "ink": 2,
-        "subscription": 2, "software": 2, "zoom": 2
+        "vendor": [
+            "staples", "office depot", "ups", "fedex"
+        ],
+        "text": [
+            "paper", "printer", "ink", "shipping", "postage",
+            "admin", "office"
+        ],
     },
     "Subcontractors": {
-        "subcontract": 4, "1099": 3, "labor": 2, "contractor": 2
+        "vendor": [],
+        "text": [
+            "labor", "contractor", "subcontractor", "install",
+            "installation", "service fee"
+        ],
     },
     "Permits / Fees": {
-        "permit": 4, "license": 2, "fee": 2, "inspection": 2
+        "vendor": [],
+        "text": [
+            "permit", "license", "inspection", "city fee", "county"
+        ],
     },
 }
 
-DEFAULT_CATEGORY = "Other"
+
+ALL_CATEGORIES = ["All"] + list(CATEGORY_RULES.keys()) + ["Other"]
+
+
+# -------------------------
+# Helpers
+# -------------------------
+
+def _normalize(text: str) -> str:
+    return re.sub(r"[^a-z0-9 ]+", " ", (text or "").lower())
+
+
+def _count_hits(haystack: str, needles: List[str]) -> int:
+    return sum(1 for n in needles if n in haystack)
+
+
+# -------------------------
+# Public API
+# -------------------------
+
+def all_categories() -> List[str]:
+    return ALL_CATEGORIES
+
 
 def categorize(raw_text: str, vendor: str = "") -> Tuple[str, float]:
     """
-    Returns (category, confidence 0..1)
-    Confidence is a rough heuristic: winning_score / (sum_scores + epsilon)
+    Returns (category, confidence)
+
+    Confidence logic (simple & explainable):
+    - Vendor hit = strong signal
+    - Text keyword hits = medium signal
+    - Confidence scaled to max ~0.95
     """
-    t = (vendor + "\n" + raw_text).lower()
-    t = re.sub(r"[^a-z0-9\s&']", " ", t)
-    t = re.sub(r"\s+", " ", t)
 
-    scores = {cat: 0 for cat in CATEGORIES.keys()}
-    for cat, rules in CATEGORIES.items():
-        for kw, w in rules.items():
-            if kw in t:
-                scores[cat] += w
+    text = _normalize(raw_text)
+    vendor_norm = _normalize(vendor)
 
-    best_cat = DEFAULT_CATEGORY
+    best_category = "Other"
     best_score = 0
-    total = 0
-    for cat, sc in scores.items():
-        total += sc
-        if sc > best_score:
-            best_score = sc
-            best_cat = cat
+
+    for category, rules in CATEGORY_RULES.items():
+        score = 0
+
+        # Vendor match (very strong)
+        if vendor_norm:
+            score += 3 * _count_hits(vendor_norm, rules["vendor"])
+
+        # OCR text keyword matches
+        score += _count_hits(text, rules["text"])
+
+        if score > best_score:
+            best_score = score
+            best_category = category
+
+    # -------------------------
+    # Confidence scaling
+    # -------------------------
 
     if best_score == 0:
-        return DEFAULT_CATEGORY, 0.25
+        # No useful signal
+        return "Other", 0.25
 
-    confidence = best_score / (total + 1e-9)
-    # clamp into a nicer range
-    confidence = max(0.40, min(0.95, confidence))
-    return best_cat, float(confidence)
+    # Score → confidence mapping
+    # 1 hit  → ~0.55
+    # 2 hits → ~0.70
+    # 3 hits → ~0.85
+    # 4+     → ~0.95
+    confidence = min(0.95, 0.40 + 0.15 * best_score)
 
-def all_categories():
-    return ["All"] + sorted(list(CATEGORIES.keys()) + [DEFAULT_CATEGORY])
+    return best_category, round(confidence, 2)
 
