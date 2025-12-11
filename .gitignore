@@ -1,1 +1,10 @@
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.venv/
+venv/
+data/bookai.sqlite
+data/receipts/
+*.log
 
