@@ -10,7 +10,7 @@ from PIL import Image, ImageOps, ImageEnhance
 from rapidocr_onnxruntime import RapidOCR
 
 
-# Create one OCR engine instance (cached by Python module import)
+# Single OCR engine instance
 _OCR = RapidOCR()
 
 
@@ -24,14 +24,14 @@ def _pdf_first_page_to_pil(pdf_bytes: bytes, zoom: float = 2.0) -> Image.Image:
 
 def _preprocess_pil(img: Image.Image) -> Image.Image:
     """
-    Lightweight preprocessing using PIL only (cloud-safe).
+    Cloud-safe preprocessing (PIL only).
     """
     img = img.convert("RGB")
     img = ImageOps.grayscale(img)
     img = ImageOps.autocontrast(img)
 
-    # Slightly boost contrast/sharpness
-    img = ImageEnhance.Contrast(img).enhance(1.6)
+    # Boost contrast/sharpness to help OCR on receipts
+    img = ImageEnhance.Contrast(img).enhance(1.7)
     img = ImageEnhance.Sharpness(img).enhance(1.4)
 
     return img.convert("RGB")
@@ -39,16 +39,14 @@ def _preprocess_pil(img: Image.Image) -> Image.Image:
 
 def _rapidocr_text(img: Image.Image) -> str:
     """
-    RapidOCR returns list of detected text lines with confidence.
-    We'll join them into a single raw_text block for parsing.
+    RapidOCR returns a list of [box, text, score]. We join lines.
     """
     arr = np.array(img)
-    result, _elapse = _OCR(arr)
+    result, _ = _OCR(arr)
 
     if not result:
         return ""
 
-    # result items look like: [ [box_points], "text", score ]
     lines: List[str] = []
     for item in result:
         try:
@@ -63,8 +61,8 @@ def _rapidocr_text(img: Image.Image) -> str:
 
 def ocr_upload(file_name: str, file_bytes: bytes) -> Tuple[Image.Image, str]:
     """
-    Returns: (preview_image, raw_text)
-    Works on Streamlit Cloud (no tesseract/cv2).
+    Returns (preview_image, raw_text)
+    Works for images + PDFs on Streamlit Cloud (no system tesseract needed).
     """
     lower = (file_name or "").lower()
 
@@ -75,7 +73,6 @@ def ocr_upload(file_name: str, file_bytes: bytes) -> Tuple[Image.Image, str]:
 
     pre = _preprocess_pil(pil_img)
     text = _rapidocr_text(pre)
-
     return pre, text
 
 
