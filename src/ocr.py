@@ -1,121 +1,82 @@
 from __future__ import annotations
 
 import io
-import shutil
-from typing import Tuple
+from typing import Tuple, List
 
 import fitz  # PyMuPDF
 import numpy as np
-import cv2
-from PIL import Image
-import pytesseract
+from PIL import Image, ImageOps, ImageEnhance
+
+from rapidocr_onnxruntime import RapidOCR
 
 
-def _tesseract_available() -> bool:
-    """
-    Streamlit Community Cloud typically does NOT have the system 'tesseract' binary.
-    Locally, you installed it via brew.
-    """
-    return shutil.which("tesseract") is not None
+# Create one OCR engine instance (cached by Python module import)
+_OCR = RapidOCR()
 
 
-def pdf_extract_text(pdf_bytes: bytes, max_pages: int = 2) -> str:
-    """
-    Extract embedded text from a PDF (works for digitally-generated invoices).
-    This does NOT require OCR and works on Streamlit Cloud.
-    """
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    text_parts = []
-    for i in range(min(len(doc), max_pages)):
-        page = doc.load_page(i)
-        t = page.get_text("text") or ""
-        if t.strip():
-            text_parts.append(t)
-    return "\n".join(text_parts).strip()
-
-
-def pdf_first_page_to_pil(pdf_bytes: bytes, zoom: float = 2.0) -> Image.Image:
-    """
-    Render first page of a PDF as an image (needed for OCR on scanned PDFs).
-    """
+def _pdf_first_page_to_pil(pdf_bytes: bytes, zoom: float = 2.0) -> Image.Image:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc.load_page(0)
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, alpha=False)
-    img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
-    return img
+    return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
 
 
-def preprocess_for_ocr(pil_img: Image.Image) -> Image.Image:
+def _preprocess_pil(img: Image.Image) -> Image.Image:
     """
-    Light preprocessing to improve OCR accuracy on receipts.
+    Lightweight preprocessing using PIL only (cloud-safe).
     """
-    img = np.array(pil_img)
-    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    img = img.convert("RGB")
+    img = ImageOps.grayscale(img)
+    img = ImageOps.autocontrast(img)
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+    # Slightly boost contrast/sharpness
+    img = ImageEnhance.Contrast(img).enhance(1.6)
+    img = ImageEnhance.Sharpness(img).enhance(1.4)
 
-    thr = cv2.adaptiveThreshold(
-        gray,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31,
-        10,
-    )
-
-    return Image.fromarray(thr).convert("RGB")
+    return img.convert("RGB")
 
 
-def ocr_image(pil_img: Image.Image) -> str:
+def _rapidocr_text(img: Image.Image) -> str:
     """
-    OCR if tesseract is available; otherwise return empty string (no crash).
+    RapidOCR returns list of detected text lines with confidence.
+    We'll join them into a single raw_text block for parsing.
     """
-    if not _tesseract_available():
+    arr = np.array(img)
+    result, _elapse = _OCR(arr)
+
+    if not result:
         return ""
 
-    config = "--oem 3 --psm 6"
-    try:
-        return pytesseract.image_to_string(pil_img, config=config)
-    except Exception:
-        return ""
+    # result items look like: [ [box_points], "text", score ]
+    lines: List[str] = []
+    for item in result:
+        try:
+            text = item[1]
+            if text and str(text).strip():
+                lines.append(str(text).strip())
+        except Exception:
+            continue
+
+    return "\n".join(lines).strip()
 
 
 def ocr_upload(file_name: str, file_bytes: bytes) -> Tuple[Image.Image, str]:
     """
-    Returns (preview_image_used_for_ocr, raw_text)
-
-    Behavior:
-    - Images: OCR if tesseract exists; otherwise returns "" (manual entry fallback).
-    - PDFs:
-        1) First try embedded text extraction (works on Streamlit Cloud).
-        2) If empty, then try OCR on rendered first page (requires tesseract).
-        3) If OCR not available, do NOT crash; return "" and let UI handle manual entry.
+    Returns: (preview_image, raw_text)
+    Works on Streamlit Cloud (no tesseract/cv2).
     """
-    lower = file_name.lower()
+    lower = (file_name or "").lower()
 
-    # PDF path
     if lower.endswith(".pdf"):
-        # 1) Try embedded text first (cloud-friendly)
-        embedded = pdf_extract_text(file_bytes)
-        if embedded.strip():
-            # Make a preview image anyway (nice UI), but not required for extraction
-            preview = pdf_first_page_to_pil(file_bytes)
-            return preview, embedded
+        pil_img = _pdf_first_page_to_pil(file_bytes)
+    else:
+        pil_img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
 
-        # 2) If it's scanned (no embedded text), try OCR if available
-        preview = pdf_first_page_to_pil(file_bytes)
-        pre = preprocess_for_ocr(preview)
-        text = ocr_image(pre)
+    pre = _preprocess_pil(pil_img)
+    text = _rapidocr_text(pre)
 
-        # 3) If OCR isn't available, text will be ""
-        return pre, text
-
-    # Image path
-    pil_img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-    pre = preprocess_for_ocr(pil_img)
-    text = ocr_image(pre)
     return pre, text
+
 
 
