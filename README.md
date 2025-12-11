@@ -9,4 +9,5 @@ source .venv/bin/activate  # Mac/Linux
 # .venv\Scripts\activate   # Windows PowerShell
 
 pip install -r requirements.txt
+brew install tesseract
 
