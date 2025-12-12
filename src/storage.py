@@ -3,32 +3,44 @@ from __future__ import annotations
 import csv
 import io
 import uuid
-from dataclasses import dataclass
+import hashlib
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 TRANSACTIONS_CSV = "transactions.csv"
 
 
-@dataclass
-class Txn:
-    id: str
-    date: str
-    vendor: str
-    amount: float
-    category: str
-    account_code: str
-    confidence: float
-    job: str
-    notes: str
-    receipt_path: str
-    created_at: str
-    needs_review: int
+def _now() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 
 def _csv_path(ws_dir: Path) -> Path:
     return ws_dir / TRANSACTIONS_CSV
+
+
+def _fieldnames() -> List[str]:
+    return [
+        "id",
+        "group_id",
+        "date",
+        "vendor",
+        "amount",
+        "category",
+        "account_code",
+        "job",
+        "notes",
+        "confidence",
+        "confidence_notes",
+        "needs_review",
+        "receipt_path",
+        "receipt_hash",
+        "created_at",
+        "updated_at",
+        "approved_at",
+        "deleted",
+        "deleted_at",
+    ]
 
 
 def ensure_store(ws_dir: Path) -> None:
@@ -36,17 +48,11 @@ def ensure_store(ws_dir: Path) -> None:
     if p.exists():
         return
     with p.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(
-            f,
-            fieldnames=[
-                "id","date","vendor","amount","category","account_code","confidence",
-                "job","notes","receipt_path","created_at","needs_review"
-            ],
-        )
+        w = csv.DictWriter(f, fieldnames=_fieldnames())
         w.writeheader()
 
 
-def list_txns(ws_dir: Path) -> List[Dict]:
+def _read_all(ws_dir: Path) -> List[Dict]:
     ensure_store(ws_dir)
     p = _csv_path(ws_dir)
     rows: List[Dict] = []
@@ -57,10 +63,37 @@ def list_txns(ws_dir: Path) -> List[Dict]:
             row["amount"] = float(row.get("amount") or 0)
             row["confidence"] = float(row.get("confidence") or 0)
             row["needs_review"] = int(row.get("needs_review") or 0)
+            row["deleted"] = int(row.get("deleted") or 0)
             rows.append(row)
-    # newest first
-    rows.sort(key=lambda x: x.get("created_at",""), reverse=True)
+    rows.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     return rows
+
+
+def _write_all(ws_dir: Path, rows: List[Dict]) -> None:
+    p = _csv_path(ws_dir)
+    with p.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=_fieldnames())
+        w.writeheader()
+        for r in rows:
+            rr = dict(r)
+            rr["amount"] = f"{float(rr.get('amount') or 0):.2f}"
+            rr["confidence"] = f"{float(rr.get('confidence') or 0):.2f}"
+            rr["needs_review"] = str(int(rr.get("needs_review") or 0))
+            rr["deleted"] = str(int(rr.get("deleted") or 0))
+            w.writerow({k: rr.get(k, "") for k in _fieldnames()})
+
+
+def list_txns(ws_dir: Path, include_deleted: bool = False, only_deleted: bool = False) -> List[Dict]:
+    rows = _read_all(ws_dir)
+    if only_deleted:
+        return [r for r in rows if int(r.get("deleted") or 0) == 1]
+    if include_deleted:
+        return rows
+    return [r for r in rows if int(r.get("deleted") or 0) == 0]
+
+
+def _hash_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()[:24]
 
 
 def add_txn(
@@ -72,15 +105,18 @@ def add_txn(
     category: str,
     account_code: str,
     confidence: float,
+    confidence_notes: str,
     job: str,
     notes: str,
     receipt_bytes: bytes,
     receipt_filename: str,
+    group_id: str = "",
 ) -> str:
     ensure_store(ws_dir)
 
     txn_id = uuid.uuid4().hex[:12]
-    created_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    created_at = _now()
+    receipt_hash = _hash_bytes(receipt_bytes)
 
     # store receipt
     safe_name = receipt_filename.replace("/", "_").replace("\\", "_")
@@ -88,111 +124,126 @@ def add_txn(
     receipt_abs = ws_dir / receipt_rel
     receipt_abs.write_bytes(receipt_bytes)
 
-    needs_review = int(confidence < 0.75 or not vendor or not date or amount <= 0)
+    needs_review = int(confidence < 0.75 or not vendor or not date or float(amount) <= 0)
 
     row = {
         "id": txn_id,
-        "date": date or "",
-        "vendor": vendor or "",
-        "amount": f"{float(amount):.2f}",
-        "category": category or "Other",
-        "account_code": account_code or "",
-        "confidence": f"{float(confidence):.2f}",
+        "group_id": group_id or "",
+        "date": (date or "").strip(),
+        "vendor": (vendor or "").strip(),
+        "amount": float(amount),
+        "category": (category or "Other").strip(),
+        "account_code": (account_code or "").strip(),
         "job": (job or "").strip(),
         "notes": (notes or "").strip(),
+        "confidence": float(confidence),
+        "confidence_notes": (confidence_notes or "").strip(),
+        "needs_review": needs_review,
         "receipt_path": receipt_rel,
+        "receipt_hash": receipt_hash,
         "created_at": created_at,
-        "needs_review": str(needs_review),
+        "updated_at": "",
+        "approved_at": "",
+        "deleted": 0,
+        "deleted_at": "",
     }
 
-    p = _csv_path(ws_dir)
-    with p.open("a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=row.keys())
-        w.writerow(row)
+    rows = _read_all(ws_dir)
+
+    # duplicate warning is handled in UI; we still store it
+    rows.append(row)
+    _write_all(ws_dir, rows)
 
     return txn_id
 
 
 def update_txn(ws_dir: Path, txn_id: str, patch: Dict) -> None:
-    ensure_store(ws_dir)
-    rows = list_txns(ws_dir)
+    rows = _read_all(ws_dir)
     for r in rows:
         if r["id"] == txn_id:
             r.update(patch)
-            # recompute needs_review if relevant
+
+            # normalize numeric fields if present
+            if "amount" in r:
+                r["amount"] = float(r.get("amount") or 0)
+            if "confidence" in r:
+                r["confidence"] = float(r.get("confidence") or 0)
+
+            # recompute needs_review
             conf = float(r.get("confidence") or 0)
             amt = float(r.get("amount") or 0)
             needs = int(conf < 0.75 or not r.get("vendor") or not r.get("date") or amt <= 0)
             r["needs_review"] = needs
+
+            if not r.get("updated_at"):
+                r["updated_at"] = _now()
             break
 
-    p = _csv_path(ws_dir)
-    with p.open("w", newline="", encoding="utf-8") as f:
-        fieldnames = [
-            "id","date","vendor","amount","category","account_code","confidence",
-            "job","notes","receipt_path","created_at","needs_review"
-        ]
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in rows:
-            # keep numeric formatting stable
-            r2 = dict(r)
-            r2["amount"] = f"{float(r2.get('amount') or 0):.2f}"
-            r2["confidence"] = f"{float(r2.get('confidence') or 0):.2f}"
-            w.writerow(r2)
+    _write_all(ws_dir, rows)
 
 
-def delete_txn(ws_dir: Path, txn_id: str) -> None:
-    ensure_store(ws_dir)
-    rows = list_txns(ws_dir)
-
-    kept = []
-    receipt_to_delete: Optional[str] = None
+def soft_delete_txn(ws_dir: Path, txn_id: str) -> None:
+    rows = _read_all(ws_dir)
     for r in rows:
-        if r["id"] == txn_id:
-            receipt_to_delete = r.get("receipt_path")
+        if r["id"] == txn_id and int(r.get("deleted") or 0) == 0:
+            r["deleted"] = 1
+            r["deleted_at"] = _now()
+            r["updated_at"] = _now()
+            break
+    _write_all(ws_dir, rows)
+
+
+def undo_delete_txn(ws_dir: Path, txn_id: str) -> None:
+    rows = _read_all(ws_dir)
+    for r in rows:
+        if r["id"] == txn_id and int(r.get("deleted") or 0) == 1:
+            r["deleted"] = 0
+            r["deleted_at"] = ""
+            r["updated_at"] = _now()
+            break
+    _write_all(ws_dir, rows)
+
+
+def purge_deleted_txn(ws_dir: Path, txn_id: str) -> None:
+    rows = _read_all(ws_dir)
+    kept = []
+    to_delete_path: Optional[str] = None
+    for r in rows:
+        if r["id"] == txn_id and int(r.get("deleted") or 0) == 1:
+            to_delete_path = r.get("receipt_path") or None
         else:
             kept.append(r)
 
-    if receipt_to_delete:
-        fpath = ws_dir / receipt_to_delete
+    if to_delete_path:
+        fpath = ws_dir / to_delete_path
         if fpath.exists():
-            fpath.unlink()
+            try:
+                fpath.unlink()
+            except Exception:
+                pass
 
-    p = _csv_path(ws_dir)
-    with p.open("w", newline="", encoding="utf-8") as f:
-        fieldnames = [
-            "id","date","vendor","amount","category","account_code","confidence",
-            "job","notes","receipt_path","created_at","needs_review"
-        ]
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in kept:
-            r2 = dict(r)
-            r2["amount"] = f"{float(r2.get('amount') or 0):.2f}"
-            r2["confidence"] = f"{float(r2.get('confidence') or 0):.2f}"
-            w.writerow(r2)
+    _write_all(ws_dir, kept)
 
 
-def build_accountant_pack(ws_dir: Path) -> tuple[bytes, bytes]:
+def build_accountant_pack(ws_dir: Path) -> Tuple[bytes, bytes]:
     """
     Returns (csv_bytes, zip_bytes)
     ZIP organized: YYYY-MM/<Category>/receiptfile
     """
     import zipfile
 
-    rows = list_txns(ws_dir)
+    rows = list_txns(ws_dir, include_deleted=False)
 
     # CSV
     out = io.StringIO()
-    out.write("Date,Vendor,Amount,Category,AccountCode,Job,Notes,ReceiptFilename,Confidence\n")
+    out.write("Date,Vendor,Amount,Category,AccountCode,Job,Notes,ReceiptFilename,Confidence,ApprovedAt\n")
     for r in rows:
         receipt_fn = (r.get("receipt_path") or "").split("/")[-1]
         out.write(
             f"{r.get('date','')},{_csv_escape(r.get('vendor',''))},{float(r.get('amount') or 0):.2f},"
             f"{_csv_escape(r.get('category',''))},{_csv_escape(r.get('account_code',''))},"
             f"{_csv_escape(r.get('job',''))},{_csv_escape(r.get('notes',''))},"
-            f"{_csv_escape(receipt_fn)},{float(r.get('confidence') or 0):.2f}\n"
+            f"{_csv_escape(receipt_fn)},{float(r.get('confidence') or 0):.2f},{_csv_escape(r.get('approved_at',''))}\n"
         )
     csv_bytes = out.getvalue().encode("utf-8")
 
@@ -213,8 +264,16 @@ def build_accountant_pack(ws_dir: Path) -> tuple[bytes, bytes]:
     return csv_bytes, zip_bytes
 
 
+def build_monthly_pnl_csv(pnl_df) -> bytes:
+    """
+    pnl_df is a pandas pivot table. We export it to CSV bytes.
+    """
+    return pnl_df.to_csv().encode("utf-8")
+
+
 def _csv_escape(x: str) -> str:
     x = str(x or "")
     if any(c in x for c in [",", '"', "\n"]):
         x = '"' + x.replace('"', '""') + '"'
     return x
+
