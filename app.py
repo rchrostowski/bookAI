@@ -644,4 +644,115 @@ with tab_deleted:
                 st.warning("Purged permanently 🧨")
                 st.rerun()
 
+# ==========================================================
+# PRIVACY POLICY
+# ==========================================================
+with tab_privacy:
+    st.header("Privacy Policy")
+    st.caption("Last updated: " + datetime.utcnow().strftime("%B %d, %Y"))
+
+    st.markdown("""
+### Overview
+
+BookIQ is built to help small businesses organize receipts and prepare accountant-ready records.
+We take privacy seriously and collect **only the data required to provide this service**.
+
+We do **not** sell, share, rent, or monetize user data in any way.
+
+---
+
+### What Data BookIQ Stores
+
+BookIQ only stores data that users explicitly upload or create, including:
+
+- Receipt images or PDFs you upload
+- Extracted receipt details (vendor, date, total amount)
+- Categories, account codes, and job assignments
+- Optional notes added by the user
+- Timestamps related to receipt creation, approval, or deletion
+
+BookIQ does **not** store:
+
+- Bank account credentials
+- Credit card numbers
+- Login passwords
+- Government IDs
+- Location tracking data
+- Personal identity profiles
+
+---
+
+### How Your Data Is Used
+
+Your data is used **only** to:
+
+- Display receipts inside your workspace
+- Automatically categorize and organize receipts
+- Generate accountant-ready CSV exports
+- Build organized receipt ZIP files
+- Improve categorization accuracy *within your workspace only*
+
+Your data is **never**:
+
+- Sold or licensed
+- Shared with advertisers
+- Used to train external AI models
+- Viewed or reviewed by humans
+- Combined with data from other workspaces
+
+---
+
+### AI & Automation
+
+BookIQ uses automated software to extract text and suggest categories.
+
+Important clarifications:
+
+- Learning happens **per workspace**
+- No receipt data is shared across businesses
+- No human reviews your receipts
+- No uploaded data is used for external AI training
+
+---
+
+### Data Storage & Retention
+
+- Uploaded data is stored securely and isolated by workspace
+- Deleted receipts are soft-deleted and can be restored
+- Users may permanently purge deleted receipts at any time
+- Users may export all data whenever needed
+
+If you stop using BookIQ, your data remains inactive unless explicitly deleted.
+
+---
+
+### Security Notice
+
+BookIQ uses standard security practices to protect uploaded data.
+However, BookIQ is an early-stage product and should not be used
+to store highly sensitive personal or financial information beyond receipts.
+
+---
+
+### Your Control
+
+You are always in control of your data:
+
+- Upload only what you choose
+- Edit or delete receipts at any time
+- Export your data without restriction
+- Permanently remove deleted data
+
+---
+
+### Policy Updates
+
+If this policy changes, the updated version will always be available inside the app.
+Continued use of BookIQ implies acceptance of the current policy.
+
+
+
+""")
+
+
 
