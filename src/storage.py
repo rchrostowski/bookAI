@@ -59,7 +59,6 @@ def _read_all(ws_dir: Path) -> List[Dict]:
     with p.open("r", newline="", encoding="utf-8") as f:
         r = csv.DictReader(f)
         for row in r:
-            # normalize types
             row["amount"] = float(row.get("amount") or 0)
             row["confidence"] = float(row.get("confidence") or 0)
             row["needs_review"] = int(row.get("needs_review") or 0)
@@ -105,9 +104,9 @@ def add_txn(
     category: str,
     account_code: str,
     confidence: float,
-    confidence_notes: str,
-    job: str,
-    notes: str,
+    confidence_notes: str = "",
+    job: str = "",
+    notes: str = "",
     receipt_bytes: bytes,
     receipt_filename: str,
     group_id: str = "",
@@ -118,10 +117,10 @@ def add_txn(
     created_at = _now()
     receipt_hash = _hash_bytes(receipt_bytes)
 
-    # store receipt
     safe_name = receipt_filename.replace("/", "_").replace("\\", "_")
     receipt_rel = f"receipts/{txn_id}_{safe_name}"
     receipt_abs = ws_dir / receipt_rel
+    receipt_abs.parent.mkdir(parents=True, exist_ok=True)
     receipt_abs.write_bytes(receipt_bytes)
 
     needs_review = int(confidence < 0.75 or not vendor or not date or float(amount) <= 0)
@@ -149,11 +148,8 @@ def add_txn(
     }
 
     rows = _read_all(ws_dir)
-
-    # duplicate warning is handled in UI; we still store it
     rows.append(row)
     _write_all(ws_dir, rows)
-
     return txn_id
 
 
@@ -162,26 +158,20 @@ def update_txn(ws_dir: Path, txn_id: str, patch: Dict) -> None:
     for r in rows:
         if r["id"] == txn_id:
             r.update(patch)
+            r["amount"] = float(r.get("amount") or 0)
+            r["confidence"] = float(r.get("confidence") or 0)
 
-            # normalize numeric fields if present
-            if "amount" in r:
-                r["amount"] = float(r.get("amount") or 0)
-            if "confidence" in r:
-                r["confidence"] = float(r.get("confidence") or 0)
-
-            # recompute needs_review
             conf = float(r.get("confidence") or 0)
             amt = float(r.get("amount") or 0)
             needs = int(conf < 0.75 or not r.get("vendor") or not r.get("date") or amt <= 0)
             r["needs_review"] = needs
 
-            if not r.get("updated_at"):
-                r["updated_at"] = _now()
+            r["updated_at"] = _now()
             break
-
     _write_all(ws_dir, rows)
 
 
+# ✅ THESE ARE THE FUNCTIONS YOUR APP IMPORTS
 def soft_delete_txn(ws_dir: Path, txn_id: str) -> None:
     rows = _read_all(ws_dir)
     for r in rows:
@@ -208,6 +198,7 @@ def purge_deleted_txn(ws_dir: Path, txn_id: str) -> None:
     rows = _read_all(ws_dir)
     kept = []
     to_delete_path: Optional[str] = None
+
     for r in rows:
         if r["id"] == txn_id and int(r.get("deleted") or 0) == 1:
             to_delete_path = r.get("receipt_path") or None
@@ -226,15 +217,10 @@ def purge_deleted_txn(ws_dir: Path, txn_id: str) -> None:
 
 
 def build_accountant_pack(ws_dir: Path) -> Tuple[bytes, bytes]:
-    """
-    Returns (csv_bytes, zip_bytes)
-    ZIP organized: YYYY-MM/<Category>/receiptfile
-    """
     import zipfile
 
     rows = list_txns(ws_dir, include_deleted=False)
 
-    # CSV
     out = io.StringIO()
     out.write("Date,Vendor,Amount,Category,AccountCode,Job,Notes,ReceiptFilename,Confidence,ApprovedAt\n")
     for r in rows:
@@ -247,7 +233,6 @@ def build_accountant_pack(ws_dir: Path) -> Tuple[bytes, bytes]:
         )
     csv_bytes = out.getvalue().encode("utf-8")
 
-    # ZIP
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
         for r in rows:
@@ -255,7 +240,7 @@ def build_accountant_pack(ws_dir: Path) -> Tuple[bytes, bytes]:
             src = ws_dir / rel
             if not rel or not src.exists():
                 continue
-            month = (r.get("date") or "unknown")[:7]  # YYYY-MM
+            month = (r.get("date") or "unknown")[:7]
             cat = (r.get("category") or "Other").replace("/", "-")
             dest = f"{month}/{cat}/{src.name}"
             z.write(src, dest)
@@ -265,9 +250,6 @@ def build_accountant_pack(ws_dir: Path) -> Tuple[bytes, bytes]:
 
 
 def build_monthly_pnl_csv(pnl_df) -> bytes:
-    """
-    pnl_df is a pandas pivot table. We export it to CSV bytes.
-    """
     return pnl_df.to_csv().encode("utf-8")
 
 
