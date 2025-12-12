@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-from pathlib import Path
 
 from src.workspace import workspace_dir
 from src.storage import (
@@ -28,6 +27,9 @@ from src.categorize import categorize
 
 st.set_page_config(page_title="BookIQ", page_icon="🧾", layout="wide")
 
+# -------------------------
+# Chart of Accounts (simple mapping)
+# -------------------------
 COA = {
     "Fuel": ("6100", "Fuel"),
     "Meals": ("6200", "Meals & Entertainment"),
@@ -40,10 +42,14 @@ COA = {
     "Other": ("6999", "Other"),
 }
 
+
 def coa_for_category(cat: str):
     return COA.get(cat, COA["Other"])
 
 
+# -------------------------
+# Sidebar: Workspace
+# -------------------------
 with st.sidebar:
     st.title("🧾 BookIQ")
     st.caption("Upload receipts → auto-read → review → export")
@@ -60,13 +66,13 @@ with st.sidebar:
     st.markdown("### How it works")
     st.markdown(
         "1) Upload a receipt photo\n"
-        "2) BookIQ extracts **vendor/date/total**\n"
-        "3) It assigns a category + account code\n"
-        "4) Export CSV + receipt ZIP for your accountant\n"
+        "2) BookIQ extracts **vendor / date / total**\n"
+        "3) It categorizes + assigns an account code\n"
+        "4) Export CSV + receipts ZIP for your accountant\n"
     )
 
 if not st.session_state.get("ws_code"):
-    st.info("Enter a **workspace code** in the sidebar.")
+    st.info("Enter a **workspace code** in the sidebar to begin.")
     st.stop()
 
 WS_DIR = workspace_dir(st.session_state["ws_code"])
@@ -79,9 +85,9 @@ tab_upload, tab_review, tab_browse, tab_reports, tab_export, tab_deleted = st.ta
     ["1) Upload", "2) Needs review", "3) Browse", "4) Reports", "5) Export", "Recently deleted"]
 )
 
-# -------------------------
+# ==========================================================
 # 1) UPLOAD
-# -------------------------
+# ==========================================================
 with tab_upload:
     st.header("Upload a receipt")
     st.write("Upload a receipt photo (JPG/PNG) or PDF. We'll extract fields, categorize, and save it.")
@@ -93,6 +99,7 @@ with tab_upload:
     else:
         file_bytes = up.getvalue()
 
+        # Run OCR once per file to avoid re-running on every Streamlit rerun
         key = f"ocr::{up.name}::{len(file_bytes)}"
         if st.session_state.get("ocr_key") != key:
             preview_img, raw_text = ocr_upload(up.name, file_bytes)
@@ -103,15 +110,15 @@ with tab_upload:
         preview_img = st.session_state.get("preview_img")
         raw_text = st.session_state.get("raw_text") or ""
 
-        fields = extract_fields(raw_text)
+        fields = extract_fields(raw_text) if raw_text else {"vendor": "", "date": "", "amount": 0.0}
 
         vendor = (fields.get("vendor") or "").strip()
         date = (fields.get("date") or "").strip()
         amount = float(fields.get("amount") or 0.0)
 
         suggestion = categorize(raw_text, vendor=vendor, memory=MEM)
-        category = suggestion["category"]
-        confidence = float(suggestion["confidence"])
+        category = suggestion.get("category", "Other")
+        confidence = float(suggestion.get("confidence", 0.35))
         reasons = suggestion.get("reasons", [])
 
         account_code, account_name = coa_for_category(category)
@@ -148,7 +155,7 @@ with tab_upload:
             account_code, account_name = coa_for_category(category)
             st.caption(f"Account: **{account_code} — {account_name}**")
 
-            st.metric("AI confidence", f"{int(confidence*100)}%")
+            st.metric("AI confidence", f"{int(confidence * 100)}%")
             if reasons:
                 st.caption("Why:")
                 st.write("• " + "\n• ".join(reasons))
@@ -176,11 +183,13 @@ with tab_upload:
 
                 st.success("Saved ✅")
 
-# -------------------------
+
+# ==========================================================
 # 2) NEEDS REVIEW
-# -------------------------
+# ==========================================================
 with tab_review:
     st.header("Needs review")
+
     rows = list_txns(WS_DIR, include_deleted=False)
     review = [r for r in rows if int(r.get("needs_review") or 0) == 1]
 
@@ -200,40 +209,52 @@ with tab_review:
                     st.write(f"Category: `{r.get('category','Other')}`  |  Account: `{r.get('account_code','')}`")
 
                 with c2:
-                    new_vendor = st.text_input("Vendor", value=r.get("vendor",""), key=f"rv_{r['id']}")
-                    new_date = st.text_input("Date", value=r.get("date",""), key=f"rd_{r['id']}")
-                    new_amount = st.number_input("Amount", min_value=0.0, value=float(r.get("amount") or 0), step=0.01, key=f"ra_{r['id']}")
+                    new_vendor = st.text_input("Vendor", value=r.get("vendor", ""), key=f"rv_{r['id']}")
+                    new_date = st.text_input("Date", value=r.get("date", ""), key=f"rd_{r['id']}")
+                    new_amount = st.number_input(
+                        "Amount",
+                        min_value=0.0,
+                        value=float(r.get("amount") or 0),
+                        step=0.01,
+                        key=f"ra_{r['id']}",
+                    )
 
                     new_cat = st.selectbox(
                         "Category",
                         options=list(COA.keys()),
-                        index=list(COA.keys()).index(r.get("category","Other")) if r.get("category","Other") in COA else 0,
-                        key=f"rc_{r['id']}"
+                        index=list(COA.keys()).index(r.get("category", "Other"))
+                        if r.get("category", "Other") in COA
+                        else 0,
+                        key=f"rc_{r['id']}",
                     )
                     code, _ = coa_for_category(new_cat)
 
                     known_jobs = get_known_jobs(MEM)
                     new_job_pick = st.selectbox("Job", [""] + known_jobs, index=0, key=f"rjpick_{r['id']}")
                     if new_job_pick == "":
-                        new_job = st.text_input("Or type job", value=r.get("job",""), key=f"rj_{r['id']}")
+                        new_job = st.text_input("Or type job", value=r.get("job", ""), key=f"rj_{r['id']}")
                     else:
                         new_job = new_job_pick
 
-                    new_notes = st.text_input("Notes", value=r.get("notes",""), key=f"rn_{r['id']}")
+                    new_notes = st.text_input("Notes", value=r.get("notes", ""), key=f"rn_{r['id']}")
 
                 with c3:
                     if st.button("Approve", type="primary", key=f"ap_{r['id']}"):
-                        update_txn(WS_DIR, r["id"], {
-                            "vendor": new_vendor,
-                            "date": new_date,
-                            "amount": float(new_amount),
-                            "category": new_cat,
-                            "account_code": code,
-                            "job": new_job,
-                            "notes": new_notes,
-                            "approved_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                            "confidence": max(float(r.get("confidence") or 0), 0.90),
-                        })
+                        update_txn(
+                            WS_DIR,
+                            r["id"],
+                            {
+                                "vendor": new_vendor,
+                                "date": new_date,
+                                "amount": float(new_amount),
+                                "category": new_cat,
+                                "account_code": code,
+                                "job": new_job,
+                                "notes": new_notes,
+                                "approved_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                                "confidence": max(float(r.get("confidence") or 0), 0.90),
+                            },
+                        )
 
                         if new_job:
                             remember_job(MEM, new_job)
@@ -248,31 +269,34 @@ with tab_review:
                         st.warning("Moved to Recently deleted 🗑️")
                         st.rerun()
 
-# -------------------------
-# 3) BROWSE (FIXED SORT)
-# -------------------------
+
+# ==========================================================
+# 3) BROWSE  (✅ FIXED: sort before selecting show columns)
+# ==========================================================
 with tab_browse:
     st.header("Browse receipts")
-    rows = list_txns(WS_DIR, include_deleted=False)
 
+    rows = list_txns(WS_DIR, include_deleted=False)
     if not rows:
         st.info("No receipts yet.")
     else:
         df = pd.DataFrame(rows)
 
-        # ✅ Backfill columns in case some older rows are missing fields
-        for col, default in [
-            ("created_at", ""),
-            ("date", ""),
-            ("vendor", ""),
-            ("amount", 0.0),
-            ("category", "Other"),
-            ("account_code", ""),
-            ("job", ""),
-            ("notes", ""),
-            ("confidence", 0.0),
-            ("needs_review", 0),
-        ]:
+        # Backfill expected columns
+        defaults = {
+            "id": "",
+            "date": "",
+            "created_at": "",
+            "vendor": "",
+            "amount": 0.0,
+            "category": "Other",
+            "account_code": "",
+            "job": "",
+            "notes": "",
+            "confidence": 0.0,
+            "needs_review": 0,
+        }
+        for col, default in defaults.items():
             if col not in df.columns:
                 df[col] = default
 
@@ -310,7 +334,12 @@ with tab_browse:
             view = view[view["needs_review"] == 1]
         if q:
             def _hit(r):
-                blob = " ".join([str(r.get("vendor","")), str(r.get("notes","")), str(r.get("job","")), str(r.get("category",""))]).lower()
+                blob = " ".join([
+                    str(r.get("vendor", "")),
+                    str(r.get("notes", "")),
+                    str(r.get("job", "")),
+                    str(r.get("category", "")),
+                ]).lower()
                 return q in blob
             view = view[view.apply(_hit, axis=1)]
 
@@ -318,25 +347,31 @@ with tab_browse:
 
         show_cols = ["id", "date", "vendor", "amount", "category", "account_code", "job", "confidence", "needs_review"]
 
-        # ✅ Sort safely even if created_at is blank for some rows
-        sort_cols = ["date"]
-        if "created_at" in view.columns:
-            sort_cols.append("created_at")
+        # ✅ Sort BEFORE selecting columns (so created_at can be used even if not displayed)
+        sort_cols = [c for c in ["date", "created_at"] if c in view.columns]
+        if sort_cols:
+            sorted_view = view.sort_values(
+                by=sort_cols,
+                ascending=[False] * len(sort_cols),
+                na_position="last",
+            )
+        else:
+            sorted_view = view
 
         left, right = st.columns([1.2, 0.8], gap="large")
 
         with left:
             st.dataframe(
-                view[show_cols].sort_values(by=sort_cols, ascending=[False] * len(sort_cols)),
+                sorted_view[show_cols],
                 use_container_width=True,
                 hide_index=True
             )
-            selected_id = st.text_input("Open receipt by ID (copy from table)", value=st.session_state.get("selected_id",""))
+            selected_id = st.text_input("Open receipt by ID (copy from table)", value=st.session_state.get("selected_id", ""))
             st.session_state["selected_id"] = selected_id.strip()
 
         with right:
             st.subheader("Receipt details")
-            sel = st.session_state.get("selected_id","").strip()
+            sel = st.session_state.get("selected_id", "").strip()
             if not sel:
                 st.info("Paste an ID to view/edit.")
             else:
@@ -352,14 +387,14 @@ with tab_browse:
                     else:
                         st.caption("Receipt image not found.")
 
-                    ev = st.text_input("Vendor", value=r.get("vendor",""), key=f"ev_{sel}")
-                    ed = st.text_input("Date", value=r.get("date",""), key=f"ed_{sel}")
+                    ev = st.text_input("Vendor", value=r.get("vendor", ""), key=f"ev_{sel}")
+                    ed = st.text_input("Date", value=r.get("date", ""), key=f"ed_{sel}")
                     ea = st.number_input("Amount", min_value=0.0, value=float(r.get("amount") or 0), step=0.01, key=f"ea_{sel}")
 
                     ec = st.selectbox(
                         "Category",
                         options=list(COA.keys()),
-                        index=list(COA.keys()).index(r.get("category","Other")) if r.get("category","Other") in COA else 0,
+                        index=list(COA.keys()).index(r.get("category", "Other")) if r.get("category", "Other") in COA else 0,
                         key=f"ec_{sel}",
                     )
                     code, _ = coa_for_category(ec)
@@ -368,11 +403,11 @@ with tab_browse:
                     known_jobs = get_known_jobs(MEM)
                     ej_pick = st.selectbox("Job", [""] + known_jobs, index=0, key=f"ejpick_{sel}")
                     if ej_pick == "":
-                        ej = st.text_input("Or type job", value=r.get("job",""), key=f"ej_{sel}")
+                        ej = st.text_input("Or type job", value=r.get("job", ""), key=f"ej_{sel}")
                     else:
                         ej = ej_pick
 
-                    en = st.text_area("Notes", value=r.get("notes",""), key=f"en_{sel}")
+                    en = st.text_area("Notes", value=r.get("notes", ""), key=f"en_{sel}")
 
                     c1, c2 = st.columns(2)
                     with c1:
@@ -402,13 +437,14 @@ with tab_browse:
                             st.session_state["selected_id"] = ""
                             st.rerun()
 
-# -------------------------
+
+# ==========================================================
 # 4) REPORTS
-# -------------------------
+# ==========================================================
 with tab_reports:
     st.header("Reports")
-    rows = list_txns(WS_DIR, include_deleted=False)
 
+    rows = list_txns(WS_DIR, include_deleted=False)
     if not rows:
         st.info("No receipts yet.")
     else:
@@ -433,9 +469,10 @@ with tab_reports:
             mime="text/csv"
         )
 
-# -------------------------
+
+# ==========================================================
 # 5) EXPORT
-# -------------------------
+# ==========================================================
 with tab_export:
     st.header("Export")
     st.write("Build a CSV + receipt ZIP organized by month/category.")
@@ -445,23 +482,28 @@ with tab_export:
         st.download_button("Download CSV", data=csv_bytes, file_name="bookiq_export.csv", mime="text/csv")
         st.download_button("Download Receipts ZIP", data=zip_bytes, file_name="receipts.zip", mime="application/zip")
 
-# -------------------------
-# Deleted
-# -------------------------
+
+# ==========================================================
+# Recently deleted
+# ==========================================================
 with tab_deleted:
     st.header("Recently deleted")
-    deleted = list_txns(WS_DIR, include_deleted=True, only_deleted=True)
 
+    deleted = list_txns(WS_DIR, include_deleted=True, only_deleted=True)
     if not deleted:
         st.info("No deleted receipts.")
     else:
         ddf = pd.DataFrame(deleted)
-        for col, default in [("amount", 0.0), ("deleted_at", "")]:
+        for col, default in [("amount", 0.0), ("deleted_at", ""), ("vendor", ""), ("date", ""), ("category", "Other"), ("job", "")]:
             if col not in ddf.columns:
                 ddf[col] = default
         ddf["amount"] = pd.to_numeric(ddf["amount"], errors="coerce").fillna(0.0)
 
-        st.dataframe(ddf[["id","date","vendor","amount","category","job","deleted_at"]], use_container_width=True, hide_index=True)
+        st.dataframe(
+            ddf[["id", "date", "vendor", "amount", "category", "job", "deleted_at"]],
+            use_container_width=True,
+            hide_index=True
+        )
 
         did = st.text_input("ID to restore/purge", value="").strip()
         c1, c2 = st.columns(2)
