@@ -63,4 +63,3 @@ def ocr_upload(filename: str, file_bytes: bytes) -> Tuple[Optional[Image.Image],
     return img, text
 
 
-
