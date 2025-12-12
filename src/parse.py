@@ -4,43 +4,12 @@ import re
 from datetime import datetime
 from typing import Dict, Optional, Tuple
 
-TOTAL_LABELS = [
-    "TOTAL",
-    "AMOUNT DUE",
-    "BALANCE DUE",
-    "TOTAL DUE",
-    "GRAND TOTAL",
-    "TOTAL SALE",
-]
-
-AVOID_TOTAL_WORDS = [
-    "SUBTOTAL",
-    "SUB TOTAL",
-    "TAX",
-    "SALES TAX",
-    "TIP",
-    "GRATUITY",
-    "CHANGE",
-    "CASH",
-    "VISA",
-    "MASTERCARD",
-    "AMEX",
-    "DISC",
-    "DISCOUNT",
-]
+TOTAL_LABELS = ["TOTAL", "AMOUNT DUE", "BALANCE DUE", "TOTAL DUE", "GRAND TOTAL", "TOTAL SALE", "AMT DUE"]
+AVOID_TOTAL_WORDS = ["SUBTOTAL", "SUB TOTAL", "TAX", "SALES TAX", "TIP", "GRATUITY", "CHANGE", "CASH", "VISA", "MASTERCARD", "AMEX", "DISCOUNT", "DISC"]
 
 VENDOR_JUNK = [
-    "THANK YOU",
-    "THANKS",
-    "WELCOME",
-    "CUSTOMER COPY",
-    "MERCHANT COPY",
-    "APPROVED",
-    "DECLINED",
-    "PLEASE COME AGAIN",
-    "COPY",
-    "RECEIPT",
-    "INVOICE",
+    "THANK YOU", "THANKS", "WELCOME", "CUSTOMER COPY", "MERCHANT COPY",
+    "APPROVED", "DECLINED", "PLEASE COME AGAIN", "COPY", "RECEIPT", "INVOICE"
 ]
 
 def extract_fields(raw_text: str) -> Dict:
@@ -53,39 +22,63 @@ def extract_fields(raw_text: str) -> Dict:
 
     return {"vendor": vendor, "date": date, "amount": amount}
 
+
 def _clean_lines(text: str) -> list[str]:
     raw_lines = [l.strip() for l in (text or "").splitlines()]
     raw_lines = [re.sub(r"\s+", " ", l) for l in raw_lines]
     raw_lines = [l for l in raw_lines if l]
     return [l for l in raw_lines if len(l) > 1]
 
+
 def _extract_vendor(lines: list[str]) -> str:
-    top = lines[:12]
+    if not lines:
+        return ""
+
+    top = lines[:15]
     candidates = []
+
+    for l in top:
+        u = l.upper()
+
+        if any(j in u for j in VENDOR_JUNK):
+            continue
+        if _looks_like_phone(u) or _looks_like_date_line(u):
+            continue
+
+        digit_ratio = sum(ch.isdigit() for ch in u) / max(1, len(u))
+        if digit_ratio > 0.55:
+            continue
+
+        score = 0
+        if u == l:
+            score += 2
+        if 4 <= len(l) <= 45:
+            score += 2
+        if re.search(r"[A-Z]", u):
+            score += 1
+        if re.search(r"(COFFEE|CAFE|BAR|GRILL|RESTAURANT|SUPPLY|HARDWARE|MARKET|STORE|INC|LLC)", u):
+            score += 2
+
+        candidates.append((score, l))
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1].strip()
+
+    # Fallback: first reasonable line
     for l in top:
         u = l.upper()
         if any(j in u for j in VENDOR_JUNK):
             continue
-        if _looks_like_phone(u) or _looks_like_address(u) or _looks_like_date_line(u):
+        if _looks_like_phone(u) or _looks_like_date_line(u):
             continue
-        digit_ratio = sum(ch.isdigit() for ch in u) / max(1, len(u))
-        if digit_ratio > 0.35:
-            continue
-        score = 0
-        if u == l:
-            score += 2
-        if 4 <= len(l) <= 32:
-            score += 2
-        if re.search(r"[A-Z]", u):
-            score += 1
-        candidates.append((score, l))
-    if not candidates:
-        return ""
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    return candidates[0][1].strip()
+        return l.strip()
+
+    return top[0].strip()
+
 
 def _extract_date(text: str, lines: list[str]) -> str:
-    top_text = "\n".join(lines[:20])
+    top_text = "\n".join(lines[:25])
     candidates = []
     for src, weight in [(top_text, 2.0), (text, 1.0)]:
         for dt, _span in _find_dates(src):
@@ -94,6 +87,7 @@ def _extract_date(text: str, lines: list[str]) -> str:
         return ""
     candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
     return candidates[0][1].strftime("%Y-%m-%d")
+
 
 def _find_dates(s: str) -> list[Tuple[datetime, Tuple[int, int]]]:
     out: list[Tuple[datetime, Tuple[int, int]]] = []
@@ -113,7 +107,9 @@ def _find_dates(s: str) -> list[Tuple[datetime, Tuple[int, int]]]:
         dt = _safe_date(y, mo, d)
         if dt:
             out.append((dt, m.span()))
+
     return out
+
 
 def _safe_date(y: int, m: int, d: int) -> Optional[datetime]:
     try:
@@ -121,8 +117,10 @@ def _safe_date(y: int, m: int, d: int) -> Optional[datetime]:
     except Exception:
         return None
 
+
 def _extract_total_amount(text: str, lines: list[str]) -> float:
-    labeled_candidates = []
+    labeled = []
+
     for i, line in enumerate(lines):
         u = line.upper()
         if not any(lbl in u for lbl in TOTAL_LABELS):
@@ -139,15 +137,17 @@ def _extract_total_amount(text: str, lines: list[str]) -> float:
         amounts = []
         for chunk in near:
             amounts.extend(_find_amounts(chunk))
+
         amounts = [a for a in amounts if 0.50 <= a <= 20000.0]
         if amounts:
-            labeled_candidates.append(max(amounts))
+            labeled.append(max(amounts))
 
-    if labeled_candidates:
-        return float(max(labeled_candidates))
+    if labeled:
+        return float(max(labeled))
 
     all_amounts = [a for a in _find_amounts(text) if 0.50 <= a <= 20000.0]
     return float(max(all_amounts)) if all_amounts else 0.0
+
 
 def _find_amounts(s: str) -> list[float]:
     if not s:
@@ -161,14 +161,14 @@ def _find_amounts(s: str) -> list[float]:
             pass
     return out
 
+
 def _looks_like_phone(s: str) -> bool:
     return bool(re.search(r"\b(\+?1[-\s]?)?\(?\d{3}\)?[-\s]?\d{3}[-\s]?\d{4}\b", s))
 
-def _looks_like_address(s: str) -> bool:
-    return bool(re.search(r"\b(ST|STREET|AVE|AVENUE|RD|ROAD|BLVD|DR|DRIVE|LN|LANE|HWY|HIGHWAY)\b", s))
 
 def _looks_like_date_line(s: str) -> bool:
     return bool(re.search(r"\b(20\d{2}[-/]\d{1,2}[-/]\d{1,2})\b", s)) or bool(
         re.search(r"\b(\d{1,2}[/-]\d{1,2}[/-](\d{2}|\d{4}))\b", s)
     )
+
 
