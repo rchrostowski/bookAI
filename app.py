@@ -28,9 +28,6 @@ from src.categorize import categorize
 
 st.set_page_config(page_title="BookIQ", page_icon="🧾", layout="wide")
 
-# -------------------------
-# Default Chart of Accounts (editable later)
-# -------------------------
 COA = {
     "Fuel": ("6100", "Fuel"),
     "Meals": ("6200", "Meals & Entertainment"),
@@ -47,9 +44,6 @@ def coa_for_category(cat: str):
     return COA.get(cat, COA["Other"])
 
 
-# -------------------------
-# Sidebar: Workspace
-# -------------------------
 with st.sidebar:
     st.title("🧾 BookIQ")
     st.caption("Upload receipts → auto-read → review → export")
@@ -81,14 +75,13 @@ MEM = load_memory(WS_DIR)
 st.title("BookIQ")
 st.caption("Simple, accountant-friendly receipt capture for small businesses.")
 
-
 tab_upload, tab_review, tab_browse, tab_reports, tab_export, tab_deleted = st.tabs(
     ["1) Upload", "2) Needs review", "3) Browse", "4) Reports", "5) Export", "Recently deleted"]
 )
 
-# ==========================================================
+# -------------------------
 # 1) UPLOAD
-# ==========================================================
+# -------------------------
 with tab_upload:
     st.header("Upload a receipt")
     st.write("Upload a receipt photo (JPG/PNG) or PDF. We'll extract fields, categorize, and save it.")
@@ -100,7 +93,6 @@ with tab_upload:
     else:
         file_bytes = up.getvalue()
 
-        # Run OCR ONCE per file (prevents reruns from re-OCRing)
         key = f"ocr::{up.name}::{len(file_bytes)}"
         if st.session_state.get("ocr_key") != key:
             preview_img, raw_text = ocr_upload(up.name, file_bytes)
@@ -184,13 +176,11 @@ with tab_upload:
 
                 st.success("Saved ✅")
 
-
-# ==========================================================
+# -------------------------
 # 2) NEEDS REVIEW
-# ==========================================================
+# -------------------------
 with tab_review:
     st.header("Needs review")
-
     rows = list_txns(WS_DIR, include_deleted=False)
     review = [r for r in rows if int(r.get("needs_review") or 0) == 1]
 
@@ -258,20 +248,37 @@ with tab_review:
                         st.warning("Moved to Recently deleted 🗑️")
                         st.rerun()
 
-
-# ==========================================================
-# 3) BROWSE (filters + edit + delete)
-# ==========================================================
+# -------------------------
+# 3) BROWSE (FIXED SORT)
+# -------------------------
 with tab_browse:
     st.header("Browse receipts")
-
     rows = list_txns(WS_DIR, include_deleted=False)
+
     if not rows:
         st.info("No receipts yet.")
     else:
         df = pd.DataFrame(rows)
-        df["amount"] = df["amount"].astype(float)
-        df["confidence"] = df["confidence"].astype(float)
+
+        # ✅ Backfill columns in case some older rows are missing fields
+        for col, default in [
+            ("created_at", ""),
+            ("date", ""),
+            ("vendor", ""),
+            ("amount", 0.0),
+            ("category", "Other"),
+            ("account_code", ""),
+            ("job", ""),
+            ("notes", ""),
+            ("confidence", 0.0),
+            ("needs_review", 0),
+        ]:
+            if col not in df.columns:
+                df[col] = default
+
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+        df["confidence"] = pd.to_numeric(df["confidence"], errors="coerce").fillna(0.0)
+        df["needs_review"] = pd.to_numeric(df["needs_review"], errors="coerce").fillna(0).astype(int)
 
         jobs = sorted([j for j in df["job"].fillna("").unique().tolist() if str(j).strip()])
         vendors = sorted([v for v in df["vendor"].fillna("").unique().tolist() if str(v).strip()])
@@ -300,7 +307,7 @@ with tab_browse:
             view = view[view["category"] == cat_pick]
         view = view[view["confidence"] >= min_conf]
         if only_review:
-            view = view[view["needs_review"].astype(int) == 1]
+            view = view[view["needs_review"] == 1]
         if q:
             def _hit(r):
                 blob = " ".join([str(r.get("vendor","")), str(r.get("notes","")), str(r.get("job","")), str(r.get("category",""))]).lower()
@@ -309,11 +316,18 @@ with tab_browse:
 
         st.caption(f"{len(view)} receipts shown")
 
+        show_cols = ["id", "date", "vendor", "amount", "category", "account_code", "job", "confidence", "needs_review"]
+
+        # ✅ Sort safely even if created_at is blank for some rows
+        sort_cols = ["date"]
+        if "created_at" in view.columns:
+            sort_cols.append("created_at")
+
         left, right = st.columns([1.2, 0.8], gap="large")
+
         with left:
-            show_cols = ["id", "date", "vendor", "amount", "category", "account_code", "job", "confidence", "needs_review"]
             st.dataframe(
-                view[show_cols].sort_values(by=["date","created_at"], ascending=[False, False]),
+                view[show_cols].sort_values(by=sort_cols, ascending=[False] * len(sort_cols)),
                 use_container_width=True,
                 hide_index=True
             )
@@ -331,7 +345,6 @@ with tab_browse:
                 if not r:
                     st.warning("ID not found (or deleted).")
                 else:
-                    # Show image if exists
                     receipt_path = r.get("receipt_path") or ""
                     p = WS_DIR / receipt_path
                     if receipt_path and p.exists():
@@ -389,19 +402,22 @@ with tab_browse:
                             st.session_state["selected_id"] = ""
                             st.rerun()
 
-
-# ==========================================================
+# -------------------------
 # 4) REPORTS
-# ==========================================================
+# -------------------------
 with tab_reports:
     st.header("Reports")
-
     rows = list_txns(WS_DIR, include_deleted=False)
+
     if not rows:
         st.info("No receipts yet.")
     else:
         df = pd.DataFrame(rows)
-        df["amount"] = df["amount"].astype(float)
+        for col, default in [("date", ""), ("category", "Other"), ("amount", 0.0)]:
+            if col not in df.columns:
+                df[col] = default
+
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
         df["month"] = df["date"].astype(str).str.slice(0, 7)
 
         pnl = df.pivot_table(index="month", columns="category", values="amount", aggfunc="sum", fill_value=0).sort_index()
@@ -417,10 +433,9 @@ with tab_reports:
             mime="text/csv"
         )
 
-
-# ==========================================================
+# -------------------------
 # 5) EXPORT
-# ==========================================================
+# -------------------------
 with tab_export:
     st.header("Export")
     st.write("Build a CSV + receipt ZIP organized by month/category.")
@@ -430,19 +445,22 @@ with tab_export:
         st.download_button("Download CSV", data=csv_bytes, file_name="bookiq_export.csv", mime="text/csv")
         st.download_button("Download Receipts ZIP", data=zip_bytes, file_name="receipts.zip", mime="application/zip")
 
-
-# ==========================================================
-# Recently deleted (undo + purge)
-# ==========================================================
+# -------------------------
+# Deleted
+# -------------------------
 with tab_deleted:
     st.header("Recently deleted")
-
     deleted = list_txns(WS_DIR, include_deleted=True, only_deleted=True)
+
     if not deleted:
         st.info("No deleted receipts.")
     else:
         ddf = pd.DataFrame(deleted)
-        ddf["amount"] = ddf["amount"].astype(float)
+        for col, default in [("amount", 0.0), ("deleted_at", "")]:
+            if col not in ddf.columns:
+                ddf[col] = default
+        ddf["amount"] = pd.to_numeric(ddf["amount"], errors="coerce").fillna(0.0)
+
         st.dataframe(ddf[["id","date","vendor","amount","category","job","deleted_at"]], use_container_width=True, hide_index=True)
 
         did = st.text_input("ID to restore/purge", value="").strip()
@@ -457,4 +475,5 @@ with tab_deleted:
                 purge_deleted_txn(WS_DIR, did)
                 st.warning("Purged permanently 🧨")
                 st.rerun()
+
 
