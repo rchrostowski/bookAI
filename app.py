@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+from pathlib import Path
 
 from src.workspace import workspace_dir
 from src.storage import (
@@ -47,12 +48,57 @@ def coa_for_category(cat: str):
     return COA.get(cat, COA["Other"])
 
 
+def _utc_now() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
+def _safe_float(x, default=0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return float(default)
+
+
+def _is_missing_row(r: dict) -> bool:
+    vendor_ok = bool((r.get("vendor") or "").strip())
+    date_ok = bool((r.get("date") or "").strip())
+    amt_ok = _safe_float(r.get("amount"), 0) > 0
+    return not (vendor_ok and date_ok and amt_ok)
+
+
+def _estimate_savings(df: pd.DataFrame) -> tuple[float, int]:
+    """
+    Simple, honest estimate for the dashboard.
+    Assumptions (tweakable later):
+      - Manual per receipt: 5 min
+      - With BookIQ: auto-approved ~1 min, needs review ~3 min
+    """
+    if df.empty:
+        return 0.0, 0
+
+    for col, default in [("needs_review", 0), ("vendor", ""), ("date", ""), ("amount", 0.0)]:
+        if col not in df.columns:
+            df[col] = default
+
+    needs_review = pd.to_numeric(df["needs_review"], errors="coerce").fillna(0).astype(int)
+    auto_cnt = int((needs_review == 0).sum())
+    review_cnt = int((needs_review == 1).sum())
+
+    minutes_saved = auto_cnt * (5 - 1) + review_cnt * (5 - 3)  # 4 min + 2 min
+    hours_saved = round(minutes_saved / 60.0, 1)
+
+    # “admin cost avoided” is a story tool; keep conservative
+    admin_cost_avoided = int(hours_saved * 75)  # $75/hr blended owner/bookkeeper
+
+    return hours_saved, admin_cost_avoided
+
+
 # -------------------------
 # Sidebar: Workspace
 # -------------------------
 with st.sidebar:
     st.title("🧾 BookIQ")
-    st.caption("Upload receipts → auto-read → review → export")
+    st.caption("Receipt photos → accountant-ready records")
 
     ws_code = st.text_input(
         "Workspace code",
@@ -63,12 +109,13 @@ with st.sidebar:
         st.session_state["ws_code"] = ws_code.strip()
 
     st.divider()
-    st.markdown("### How it works")
+    st.markdown("### What happens when you upload")
     st.markdown(
-        "1) Upload a receipt photo\n"
-        "2) BookIQ extracts **vendor / date / total**\n"
-        "3) It categorizes + assigns an account code\n"
-        "4) Export CSV + receipts ZIP for your accountant\n"
+        "- BookIQ reads the receipt (OCR)\n"
+        "- Extracts **vendor / date / total**\n"
+        "- Suggests category + account code\n"
+        "- Flags only the ones that truly need review\n"
+        "- Exports a clean accountant package\n"
     )
 
 if not st.session_state.get("ws_code"):
@@ -78,11 +125,40 @@ if not st.session_state.get("ws_code"):
 WS_DIR = workspace_dir(st.session_state["ws_code"])
 MEM = load_memory(WS_DIR)
 
+# Load once for header metrics
+_all_rows = list_txns(WS_DIR, include_deleted=False)
+_df = pd.DataFrame(_all_rows) if _all_rows else pd.DataFrame()
+
+hours_saved, admin_saved = _estimate_savings(_df)
+
 st.title("BookIQ")
-st.caption("Simple, accountant-friendly receipt capture for small businesses.")
+
+# -------------------------
+# "UMPH" header: ROI + urgency
+# -------------------------
+m1, m2, m3, m4 = st.columns([1.2, 1, 1, 1])
+m1.metric("Receipts processed", 0 if _df.empty else len(_df))
+m2.metric("Hours saved (est.)", hours_saved)
+m3.metric("Admin cost avoided (est.)", f"${admin_saved}")
+# Accountant readiness score (simple)
+needs_review_cnt = 0 if _df.empty or "needs_review" not in _df.columns else int(pd.to_numeric(_df["needs_review"], errors="coerce").fillna(0).astype(int).sum())
+m4.metric("Needs review", needs_review_cnt)
+
+missing_cnt = 0
+if _all_rows:
+    missing_cnt = sum(1 for r in _all_rows if _is_missing_row(r))
+
+if missing_cnt > 0:
+    st.warning(f"⚠️ {missing_cnt} receipt(s) are missing vendor/date/amount. These create accountant follow-ups.")
+elif needs_review_cnt > 0:
+    st.info("A few receipts need a quick review — approve once and BookIQ will remember them.")
+else:
+    st.success("Accountant-ready ✅ Everything is clean and exportable.")
+
+st.caption("This dashboard is conservative on savings. The goal is to make your bookkeeping feel *done*, not *in progress*.")
 
 tab_upload, tab_review, tab_browse, tab_reports, tab_export, tab_deleted = st.tabs(
-    ["1) Upload", "2) Needs review", "3) Browse", "4) Reports", "5) Export", "Recently deleted"]
+    ["1) Upload", "2) Needs review", "3) Browse", "4) Reports", "5) Send to accountant", "Recently deleted"]
 )
 
 # ==========================================================
@@ -90,7 +166,7 @@ tab_upload, tab_review, tab_browse, tab_reports, tab_export, tab_deleted = st.ta
 # ==========================================================
 with tab_upload:
     st.header("Upload a receipt")
-    st.write("Upload a receipt photo (JPG/PNG) or PDF. We'll extract fields, categorize, and save it.")
+    st.write("Upload a receipt photo (JPG/PNG) or PDF. BookIQ extracts fields, categorizes it, and gets it accountant-ready.")
 
     up = st.file_uploader("Receipt file", type=["jpg", "jpeg", "png", "pdf"])
 
@@ -120,8 +196,12 @@ with tab_upload:
         category = suggestion.get("category", "Other")
         confidence = float(suggestion.get("confidence", 0.35))
         reasons = suggestion.get("reasons", [])
+        learned_from = int(suggestion.get("learned_from", 0) or 0)
 
         account_code, account_name = coa_for_category(category)
+
+        # Trust language (not just a %)
+        auto_approved = (confidence >= 0.80) and bool(vendor) and bool(date) and (amount > 0)
 
         colA, colB = st.columns([1, 1], gap="large")
 
@@ -133,6 +213,21 @@ with tab_upload:
                 st.code(raw_text if raw_text else "(No OCR text extracted)")
 
         with colB:
+            st.subheader("BookIQ decision")
+            if auto_approved:
+                st.success("Auto-approved ✅")
+            else:
+                st.warning("Needs review ⚠️ (approve once and BookIQ learns)")
+
+            if learned_from > 0:
+                st.caption(f"Learned from **{learned_from}** prior receipt(s) for this vendor.")
+
+            if reasons:
+                st.write("**Why:**")
+                st.write("• " + "\n• ".join(reasons))
+
+            st.divider()
+
             st.subheader("Extracted fields (editable)")
             vendor = st.text_input("Vendor", value=vendor)
             date = st.text_input("Date (YYYY-MM-DD)", value=date)
@@ -153,12 +248,9 @@ with tab_upload:
                 index=list(COA.keys()).index(category) if category in COA else list(COA.keys()).index("Other"),
             )
             account_code, account_name = coa_for_category(category)
-            st.caption(f"Account: **{account_code} — {account_name}**")
 
-            st.metric("AI confidence", f"{int(confidence * 100)}%")
-            if reasons:
-                st.caption("Why:")
-                st.write("• " + "\n• ".join(reasons))
+            st.caption(f"Account: **{account_code} — {account_name}**")
+            st.caption(f"Confidence score: **{int(confidence * 100)}%** (used only to decide what needs review)")
 
             if st.button("Save receipt", type="primary"):
                 add_txn(
@@ -178,10 +270,13 @@ with tab_upload:
 
                 if job:
                     remember_job(MEM, job)
+
+                # This is the "rules engine" / learning loop:
                 remember_vendor_mapping(MEM, vendor=vendor, category=category, account_code=account_code)
                 save_memory(WS_DIR, MEM)
 
-                st.success("Saved ✅")
+                st.success("Saved ✅ BookIQ learned this vendor for next time.")
+                st.rerun()
 
 
 # ==========================================================
@@ -189,14 +284,14 @@ with tab_upload:
 # ==========================================================
 with tab_review:
     st.header("Needs review")
-
     rows = list_txns(WS_DIR, include_deleted=False)
     review = [r for r in rows if int(r.get("needs_review") or 0) == 1]
 
     if not review:
         st.success("Nothing needs review 🎉")
+        st.caption("When this stays empty, your accountant export is painless.")
     else:
-        st.write("These receipts need a quick check (missing fields or low confidence).")
+        st.write("Approve these once. BookIQ will remember the vendor pattern and auto-approve next time.")
 
         for r in review[:200]:
             with st.container(border=True):
@@ -207,6 +302,7 @@ with tab_review:
                     st.caption(f"ID: {r['id']} • Confidence: {float(r.get('confidence') or 0):.2f}")
                     st.write(f"Date: `{r.get('date','')}`  |  Amount: **${float(r.get('amount') or 0):.2f}**")
                     st.write(f"Category: `{r.get('category','Other')}`  |  Account: `{r.get('account_code','')}`")
+                    st.caption("Tip: Fix it once → BookIQ learns this vendor going forward.")
 
                 with c2:
                     new_vendor = st.text_input("Vendor", value=r.get("vendor", ""), key=f"rv_{r['id']}")
@@ -239,7 +335,7 @@ with tab_review:
                     new_notes = st.text_input("Notes", value=r.get("notes", ""), key=f"rn_{r['id']}")
 
                 with c3:
-                    if st.button("Approve", type="primary", key=f"ap_{r['id']}"):
+                    if st.button("Approve + teach BookIQ", type="primary", key=f"ap_{r['id']}"):
                         update_txn(
                             WS_DIR,
                             r["id"],
@@ -251,17 +347,19 @@ with tab_review:
                                 "account_code": code,
                                 "job": new_job,
                                 "notes": new_notes,
-                                "approved_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                                "approved_at": _utc_now(),
+                                "needs_review": 0,
                                 "confidence": max(float(r.get("confidence") or 0), 0.90),
                             },
                         )
 
                         if new_job:
                             remember_job(MEM, new_job)
+
                         remember_vendor_mapping(MEM, vendor=new_vendor, category=new_cat, account_code=code)
                         save_memory(WS_DIR, MEM)
 
-                        st.success("Approved ✅")
+                        st.success("Approved ✅ BookIQ learned this vendor.")
                         st.rerun()
 
                     if st.button("Delete", key=f"del_{r['id']}"):
@@ -271,7 +369,7 @@ with tab_review:
 
 
 # ==========================================================
-# 3) BROWSE  (✅ FIXED: sort before selecting show columns)
+# 3) BROWSE  (sort before selecting show cols)
 # ==========================================================
 with tab_browse:
     st.header("Browse receipts")
@@ -347,7 +445,7 @@ with tab_browse:
 
         show_cols = ["id", "date", "vendor", "amount", "category", "account_code", "job", "confidence", "needs_review"]
 
-        # ✅ Sort BEFORE selecting columns (so created_at can be used even if not displayed)
+        # Sort BEFORE selecting columns
         sort_cols = [c for c in ["date", "created_at"] if c in view.columns]
         if sort_cols:
             sorted_view = view.sort_values(
@@ -420,13 +518,15 @@ with tab_browse:
                                 "account_code": code,
                                 "job": ej,
                                 "notes": en,
-                                "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                                "updated_at": _utc_now(),
+                                # if they fixed it, clear review flag
+                                "needs_review": 0 if (ev.strip() and ed.strip() and float(ea) > 0) else 1,
                             })
                             if ej:
                                 remember_job(MEM, ej)
                             remember_vendor_mapping(MEM, vendor=ev, category=ec, account_code=code)
                             save_memory(WS_DIR, MEM)
-                            st.success("Saved ✅")
+                            st.success("Saved ✅ BookIQ learned this vendor.")
                             st.rerun()
 
                     with c2:
@@ -459,6 +559,7 @@ with tab_reports:
         pnl = df.pivot_table(index="month", columns="category", values="amount", aggfunc="sum", fill_value=0).sort_index()
 
         st.subheader("Monthly expense summary (P&L-style)")
+        st.caption("This is designed to match how an accountant thinks: monthly totals by category.")
         st.dataframe(pnl, use_container_width=True)
         st.line_chart(pnl.sum(axis=1), height=220)
 
@@ -471,16 +572,41 @@ with tab_reports:
 
 
 # ==========================================================
-# 5) EXPORT
+# 5) SEND TO ACCOUNTANT (reframed export)
 # ==========================================================
 with tab_export:
-    st.header("Export")
-    st.write("Build a CSV + receipt ZIP organized by month/category.")
+    st.header("Send to accountant")
+    st.write("BookIQ creates a clean accountant package: **CSV + receipts ZIP**, organized and ready to upload.")
 
-    if st.button("Build Accountant Pack", type="primary"):
+    rows = list_txns(WS_DIR, include_deleted=False)
+    needs_review = [r for r in rows if int(r.get("needs_review") or 0) == 1]
+    missing = [r for r in rows if _is_missing_row(r)]
+
+    st.markdown("### Readiness checklist")
+    if not rows:
+        st.info("No receipts yet.")
+    else:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total receipts", len(rows))
+        c2.metric("Needs review", len(needs_review))
+        c3.metric("Missing info", len(missing))
+
+        if len(needs_review) == 0 and len(missing) == 0:
+            st.success("Accountant-ready ✅ No follow-ups expected.")
+        else:
+            st.warning("Not fully clean yet — fixing these reduces accountant back-and-forth.")
+            if len(needs_review) > 0:
+                st.write(f"• {len(needs_review)} receipt(s) need review (approve once and BookIQ learns).")
+            if len(missing) > 0:
+                st.write(f"• {len(missing)} receipt(s) are missing vendor/date/amount.")
+
+    st.divider()
+    st.markdown("### Build the package")
+
+    if st.button("Build accountant package", type="primary"):
         csv_bytes, zip_bytes = build_accountant_pack(WS_DIR)
-        st.download_button("Download CSV", data=csv_bytes, file_name="bookiq_export.csv", mime="text/csv")
-        st.download_button("Download Receipts ZIP", data=zip_bytes, file_name="receipts.zip", mime="application/zip")
+        st.download_button("Download accountant CSV", data=csv_bytes, file_name="bookiq_export.csv", mime="text/csv")
+        st.download_button("Download receipts ZIP", data=zip_bytes, file_name="receipts.zip", mime="application/zip")
 
 
 # ==========================================================
