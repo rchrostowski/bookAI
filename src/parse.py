@@ -18,14 +18,18 @@ MONTH_NAME_RE = re.compile(
     re.I,
 )
 
-# money tokens: allow 30.74, 30,74, 1,234.56
-MONEY_ANY_RE = re.compile(r"(?<!\w)\$?\s*([0-9]{1,7}(?:,[0-9]{3})*(?:[.,][0-9]{2})?|[0-9]{2,7})\b")
+# Money tokens:
+# - with cents: 30.74, 30,74, 1,234.56
+# - sometimes OCR drops punctuation: 3074 (we do NOT want to trust that as money)
+MONEY_WITH_CENTS_RE = re.compile(r"(?<!\w)\$?\s*([0-9]{1,7}(?:,[0-9]{3})*(?:[.,][0-9]{2}))\b")
+MONEY_ANY_RE = re.compile(r"(?<!\w)\$?\s*([0-9]{1,7}(?:,[0-9]{3})*(?:[.,][0-9]{2})?)\b")
 
 TOTAL_KEYS_STRONG = [
     "grand total", "amount due", "total due", "balance due",
     "total amount", "order total", "invoice total",
     "total", "amount paid", "sale total", "total sale", "sale:",
 ]
+
 EXCLUDE_AMOUNT_KEYS = [
     "discount", "coupon", "change", "cash", "tender", "tip", "gratuity", "service charge",
     "auth", "approval", "authorized", "ref", "trans", "transaction",
@@ -35,11 +39,21 @@ EXCLUDE_AMOUNT_KEYS = [
 
 # Vendor should NEVER come from these sections
 VENDOR_HARD_EXCLUDE = [
+    # payment/tender section
     "visa", "discover", "mastercard", "amex", "debit", "credit",
     "card#", "card #", "expdate", "auth", "authorization",
     "entry method", "chip", "tap", "swiped", "aid", "tsi",
     "customer copy", "merchant copy", "refund", "return policy", "policy", "visit ",
+    # register/receipt internals
+    "cashier", "cshr", "reg:", "reg ", "trx", "str:", "store#", "store #",
+    "rewards", "member", "isbn", "upc", "sku",
 ]
+
+# lines that are commonly item/line-items (not vendor)
+ITEM_LINE_HINTS = re.compile(
+    r"\b(qty|ea\b|each|@|isbn|upc|sku|\b97\d{11}\b|\b978\d{10}\b)\b",
+    re.I,
+)
 
 VENDOR_NOISE = {
     "thank you", "thanks", "welcome", "come again",
@@ -60,6 +74,7 @@ MERCHANT_BOOST = [
     "restaurant", "cafe", "coffee", "diner", "grill", "bar",
     "gas", "station", "pharmacy", "hardware", "auto",
     "books", "book", "bookseller", "bookstore",
+    "barnes", "noble",
 ]
 
 
@@ -94,22 +109,14 @@ def _looks_like_address(line: str) -> bool:
     return False
 
 def _parse_money_val(token: str) -> Optional[float]:
-    """
-    Robust:
-    - 30.74
-    - 30,74 (comma decimal)
-    - 1,234.56
-    - rejects huge nonsense
-    """
     tok = (token or "").strip()
     if not tok:
         return None
 
-    # normalize comma decimal if it looks like xx,yy
+    # normalize comma-decimal
     if "," in tok and "." not in tok and re.search(r"\d+,\d{2}$", tok):
         tok = tok.replace(",", ".")
     else:
-        # otherwise commas are thousands separators
         tok = tok.replace(",", "")
 
     try:
@@ -117,14 +124,20 @@ def _parse_money_val(token: str) -> Optional[float]:
     except Exception:
         return None
 
-    if val <= 0:
-        return None
-    if val > 99999:
+    if val <= 0 or val > 99999:
         return None
 
     return float(val)
 
-def _line_amounts(line: str) -> List[float]:
+def _line_cents_amounts(line: str) -> List[float]:
+    vals: List[float] = []
+    for tok in MONEY_WITH_CENTS_RE.findall(line or ""):
+        v = _parse_money_val(tok)
+        if v is not None:
+            vals.append(v)
+    return vals
+
+def _line_any_amounts(line: str) -> List[float]:
     vals: List[float] = []
     for tok in MONEY_ANY_RE.findall(line or ""):
         v = _parse_money_val(tok)
@@ -152,6 +165,8 @@ def _looks_like_vendor_noise(line: str) -> bool:
         return True
     if len(line) > 110:
         return True
+    if ITEM_LINE_HINTS.search(line):
+        return True
     return False
 
 def _is_garbage_vendor(line: str) -> bool:
@@ -163,11 +178,9 @@ def _is_garbage_vendor(line: str) -> bool:
     letters = sum(ch.isalpha() for ch in s)
     if letters < 5:
         return True
-    toks = [t for t in re.split(r"\s+", s) if t]
-    if toks:
-        short = sum(1 for t in toks if len(t) <= 2)
-        if (short / len(toks)) >= 0.75:
-            return True
+    # if it contains lots of commas/periods and no merchant keywords, often item text
+    if (s.count(",") + s.count(".")) >= 2 and not any(k in _norm(s) for k in ["barnes", "noble", "store", "market", "inc", "llc", "company"]):
+        return True
     return False
 
 def _collapse_spaced_letters(s: str) -> str:
@@ -178,7 +191,7 @@ def _collapse_spaced_letters(s: str) -> str:
 
 
 # -----------------------------
-# Vendor extraction
+# Vendor
 # -----------------------------
 def _vendor_score(line: str, idx: int) -> float:
     line = _clean_line(line)
@@ -191,34 +204,32 @@ def _vendor_score(line: str, idx: int) -> float:
 
     score = 0.0
 
-    # not strictly top-only: real vendor might be line 10–30 after OCR junk
-    score += max(0.0, 1.1 - 0.035 * idx)
+    # Vendor usually near top, but allow deeper because OCR junk sometimes precedes
+    score += max(0.0, 1.0 - 0.03 * idx)
 
     letters = sum(1 for c in line if c.isalpha())
     digits = sum(1 for c in line if c.isdigit())
-    score += 0.05 * letters
-    score -= 0.04 * digits
+    score += 0.045 * letters
+    score -= 0.035 * digits
 
-    # merchant keyword boost
+    # MASSIVE boost for known merchant tokens
+    if any(k in low for k in ["barnes", "noble"]):
+        score += 3.5
     if any(k in low for k in MERCHANT_BOOST):
-        score += 1.3
+        score += 1.2
 
-    # bonus for common merchant header signals
-    if "&" in line:
-        score += 0.4
-    if "#" in line:
-        score += 0.3
-
-    # penalties for footer/policy
-    if any(k in low for k in ["visit", "returns", "refund", "policy", "customer copy"]):
-        score -= 2.0
-
-    # prefer reasonable word count
-    w = line.split()
-    if 1 <= len(w) <= 12:
-        score += 0.4
-    else:
+    # penalize item/title-like punctuation + long descriptive lines
+    if ":" in line:
         score -= 0.6
+    if len(line) > 42 and not any(k in low for k in ["barnes", "noble", "store", "market", "inc", "llc", "company"]):
+        score -= 1.2
+
+    # prefer 1–10 words
+    w = line.split()
+    if 1 <= len(w) <= 10:
+        score += 0.35
+    else:
+        score -= 0.7
 
     return score
 
@@ -226,8 +237,7 @@ def extract_vendor(raw_text: str) -> Tuple[str, float, List[str]]:
     lines = [_clean_line(x) for x in (raw_text or "").splitlines()]
     lines = [ln for ln in lines if ln]
 
-    # Search deeper because OCR can emit junk first
-    window = lines[:80]
+    window = lines[:90]
 
     candidates: List[Tuple[str, int]] = []
     for i, a in enumerate(window):
@@ -247,7 +257,7 @@ def extract_vendor(raw_text: str) -> Tuple[str, float, List[str]]:
 
     seen = set()
     cand_list = []
-    for c, s in scored[:15]:
+    for c, s in scored[:18]:
         c2 = _collapse_spaced_letters(c).strip()
         k = _norm(c2)
         if k and k not in seen and s > -50:
@@ -257,12 +267,12 @@ def extract_vendor(raw_text: str) -> Tuple[str, float, List[str]]:
             break
 
     top_score = scored[0][1]
-    if top_score >= 4.0:
-        conf = 0.92
-    elif top_score >= 3.0:
-        conf = 0.85
-    elif top_score >= 2.2:
-        conf = 0.75
+    if top_score >= 4.5:
+        conf = 0.93
+    elif top_score >= 3.2:
+        conf = 0.86
+    elif top_score >= 2.3:
+        conf = 0.76
     else:
         conf = 0.60
 
@@ -270,7 +280,7 @@ def extract_vendor(raw_text: str) -> Tuple[str, float, List[str]]:
 
 
 # -----------------------------
-# Date extraction
+# Date
 # -----------------------------
 def _try_make_date(yy: int, mm: int, dd: int) -> Optional[str]:
     try:
@@ -322,7 +332,7 @@ def extract_date(raw_text: str) -> Tuple[str, float]:
 
 
 # -----------------------------
-# Amount extraction (fixes 30574 by using subtotal+tax)
+# Amount (subtotal + tax fallback, cents-only for tax/subtotal lines)
 # -----------------------------
 def extract_amount(raw_text: str) -> Tuple[float, float]:
     lines = [_clean_line(x) for x in (raw_text or "").splitlines()]
@@ -331,67 +341,73 @@ def extract_amount(raw_text: str) -> Tuple[float, float]:
         return (0.0, 0.0)
 
     n = len(lines)
-    bottom_start = int(n * 0.40) if n >= 10 else 0
+    bottom_start = int(n * 0.35) if n >= 10 else 0
     bottom = lines[bottom_start:]
 
-    subtotal = None
-    tax = None
+    subtotal: Optional[float] = None
+    tax: Optional[float] = None
 
-    # First pass: capture subtotal & tax (very reliable fallback)
+    # 1) capture subtotal and tax using cents-only values (avoids grabbing "11" or "6.000%")
     for ln in bottom:
         low = _norm(ln)
-        vals = _line_amounts(ln)
-        if not vals:
-            continue
-        v = max(vals)
 
         if "subtotal" in low and subtotal is None:
-            subtotal = v
-        if ("tax" in low or "sales tax" in low) and tax is None:
-            tax = v
+            cents_vals = _line_cents_amounts(ln)
+            if cents_vals:
+                subtotal = float(cents_vals[-1])  # take last cents value on line
+
+        if ("sales tax" in low or (("tax" in low) and "subtotal" not in low)) and tax is None:
+            cents_vals = _line_cents_amounts(ln)
+            if cents_vals:
+                tax = float(cents_vals[-1])
 
     computed_total = None
     if subtotal is not None and tax is not None:
-        computed_total = round(float(subtotal) + float(tax), 2)
+        computed_total = round(subtotal + tax, 2)
 
-    # Second pass: pick explicit TOTAL line, but sanity-check it
+    # 2) try explicit TOTAL lines (prefer cents amounts)
     for ln in reversed(bottom):
         low = _norm(ln)
         if _is_excluded_amount_line(ln):
             continue
         if "total" in low or any(k in low for k in TOTAL_KEYS_STRONG):
-            vals = _line_amounts(ln)
-            if not vals:
-                continue
-            cand = float(max(vals))
+            cents_vals = _line_cents_amounts(ln)
+            if cents_vals:
+                cand = float(max(cents_vals))
 
-            # sanity: reject insane totals when we have subtotal+tax
-            if computed_total is not None:
-                if abs(cand - computed_total) <= 0.05:
-                    return (computed_total, 0.96)
-                # if cand is wildly larger (like 30574), ignore it
-                if cand > computed_total * 20:
+                if computed_total is not None and abs(cand - computed_total) <= 0.05:
+                    return (computed_total, 0.97)
+
+                # reject insane totals vs computed_total (OCR "30574" etc)
+                if computed_total is not None and cand > computed_total * 10:
                     continue
 
-            # general sanity: receipts rarely > $10,000
-            if cand > 10000:
-                continue
+                if cand <= 10000:
+                    return (cand, 0.90)
 
-            return (cand, 0.90)
-
-    # If total line was garbage but we have subtotal+tax, trust computed
+    # 3) if total line was bad/missing, trust computed subtotal+tax
     if computed_total is not None:
-        return (computed_total, 0.92)
+        return (computed_total, 0.93)
 
-    # fallback: max reasonable amount in bottom excluding payment lines
-    vals = []
+    # 4) fallback: biggest cents amount in bottom (reasonable)
+    cents_pool: List[float] = []
     for ln in bottom:
         if _is_excluded_amount_line(ln):
             continue
-        vals.extend(_line_amounts(ln))
-    vals = [v for v in vals if 0 < v <= 10000]
-    if vals:
-        return (float(max(vals)), 0.68)
+        cents_pool.extend(_line_cents_amounts(ln))
+    cents_pool = [v for v in cents_pool if 0 < v <= 10000]
+    if cents_pool:
+        return (float(max(cents_pool)), 0.70)
+
+    # 5) last resort
+    any_pool: List[float] = []
+    for ln in bottom:
+        if _is_excluded_amount_line(ln):
+            continue
+        any_pool.extend(_line_any_amounts(ln))
+    any_pool = [v for v in any_pool if 0 < v <= 10000]
+    if any_pool:
+        return (float(max(any_pool)), 0.60)
 
     return (0.0, 0.0)
 
