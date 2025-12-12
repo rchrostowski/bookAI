@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional
 
@@ -11,18 +10,47 @@ from typing import List, Dict, Tuple, Optional
 # -----------------------------
 PHONE_RE = re.compile(r"(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}")
 STATE_ZIP_RE = re.compile(r"\b[A-Z]{2}\s+\d{5}(-\d{4})?\b")
-MONEY_RE = re.compile(r"(?<!\w)\$?\s*([0-9]{1,6}(?:,[0-9]{3})*(?:\.[0-9]{2})?)\b")
 DATE_YMD_RE = re.compile(r"\b(20\d{2})[-/](\d{2})[-/](\d{2})\b")
 DATE_MDY_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b")
 TIME_RE = re.compile(r"\b(\d{1,2}:\d{2})(?::\d{2})?\b", re.I)
 
-# Keywords for totals
-TOTAL_KEYS_STRONG = ["grand total", "amount due", "total due", "balance due", "total"]
-TOTAL_KEYS_WEAK = ["due", "balance"]
+# Money:
+# - Keep "normal dollars" (2 decimals)
+# - Also allow integer dollars (rare but happens)
+MONEY_2DP_RE = re.compile(r"(?<!\w)\$?\s*([0-9]{1,6}(?:,[0-9]{3})*(?:\.[0-9]{2}))\b")
+MONEY_INT_RE = re.compile(r"(?<!\w)\$?\s*([0-9]{1,6}(?:,[0-9]{3})*)\b")
+
+# Keywords for totals (expanded)
+TOTAL_KEYS_STRONG = [
+    "grand total",
+    "amount due",
+    "total due",
+    "balance due",
+    "amount",
+    "amount paid",
+    "total sale",
+    "sale total",
+    "total amount",
+    "order total",
+    "invoice total",
+    "total",
+]
+TOTAL_KEYS_WEAK = ["due", "balance", "amt", "paid"]
+
 EXCLUDE_AMOUNT_KEYS = [
-    "subtotal", "sub total", "tax", "sales tax", "vat", "discount", "change",
-    "cash", "tender", "tip", "gratuity", "service charge",
+    "subtotal", "sub total", "tax", "sales tax", "vat", "discount", "coupon",
+    "change", "cash", "tender", "tip", "gratuity", "service charge",
     "auth", "approval", "authorized", "ref", "trans", "transaction",
+    "debit", "credit", "visa", "mastercard", "amex", "discover",
+]
+
+# Unit traps (gas/weights/quantities) that often include 2-decimal numbers
+UNIT_TRAPS = [
+    "gal", "gallon", "gallons", "ltr", "liter", "liters", "l ",
+    "qty", "quantity", "units", "unit",
+    "lbs", "lb", "pounds", "oz", "ounces",
+    "volume", "vol", "pump",
+    "price/gal", "price per gal", "ppg", "@",
 ]
 
 # Vendor noise
@@ -39,6 +67,7 @@ ADDRESS_HINTS = {
     "pa", "nj", "ny", "ca", "tx", "fl", "il", "oh", "wa", "va", "md", "ma", "ct",
 }
 
+
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -49,12 +78,9 @@ def _clean_line(s: str) -> str:
 
 def _norm(s: str) -> str:
     s = (s or "").lower()
-    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    s = re.sub(r"[^a-z0-9 $./@]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
-
-def _has_money(line: str) -> bool:
-    return bool(MONEY_RE.search(line))
 
 def _looks_like_address(line: str) -> bool:
     up = line.upper()
@@ -68,6 +94,9 @@ def _looks_like_address(line: str) -> bool:
         return True
     return False
 
+def _has_date_or_time(line: str) -> bool:
+    return bool(DATE_YMD_RE.search(line) or DATE_MDY_RE.search(line) or TIME_RE.search(line))
+
 def _looks_like_vendor_noise(line: str) -> bool:
     low = _norm(line)
     if not low:
@@ -76,9 +105,7 @@ def _looks_like_vendor_noise(line: str) -> bool:
         return True
     if PHONE_RE.search(line):
         return True
-    if _has_money(line):
-        return True
-    if DATE_YMD_RE.search(line) or DATE_MDY_RE.search(line) or TIME_RE.search(line):
+    if _has_date_or_time(line):
         return True
     if _looks_like_address(line):
         return True
@@ -88,7 +115,6 @@ def _looks_like_vendor_noise(line: str) -> bool:
     return False
 
 def _collapse_spaced_letters(s: str) -> str:
-    # handles "S H E L L" → "SHELL"
     toks = s.split()
     if len(toks) >= 4 and all(len(t) == 1 for t in toks[:4]):
         return "".join(toks)
@@ -98,12 +124,21 @@ def _parse_money_val(token: str) -> Optional[float]:
     try:
         token = token.replace(",", "").strip()
         val = float(token)
-        # ignore insanely large numbers (often IDs)
         if val > 99999:
             return None
         return val
     except Exception:
         return None
+
+def _line_has_currency_marker(line: str) -> bool:
+    # Strong signal that a number is a dollar amount, not gallons/qty
+    l = line or ""
+    low = _norm(l)
+    return ("$" in l) or (" usd" in f" {low} ") or ("us$" in low)
+
+def _line_has_unit_trap(line: str) -> bool:
+    low = f" {_norm(line)} "
+    return any(f" {u} " in low or u in low for u in UNIT_TRAPS)
 
 
 # -----------------------------
@@ -116,26 +151,22 @@ def _vendor_score(line: str) -> float:
 
     score = 0.0
 
-    # Favor top-ish and "header-like" strings: uppercase ratio
     letters = sum(1 for c in line if c.isalpha())
     uppers = sum(1 for c in line if c.isalpha() and c.isupper())
     if letters > 0:
         score += 0.9 * (uppers / letters)
 
-    # Penalize digits and punctuation
     digits = sum(1 for c in line if c.isdigit())
     punct = sum(1 for c in line if (not c.isalnum() and c != " "))
     score -= 0.18 * digits
     score -= 0.22 * punct
 
-    # Prefer 1–5 words
     w = line.split()
     if 1 <= len(w) <= 5:
         score += 0.6
     else:
         score -= 0.3
 
-    # Small boost if “merchant-y”
     low = _norm(line)
     if any(k in low for k in ["inc", "llc", "corp", "co", "company", "market", "store", "diner", "cafe", "coffee", "gas", "station"]):
         score += 0.25
@@ -143,16 +174,11 @@ def _vendor_score(line: str) -> float:
     return score
 
 def extract_vendor(raw_text: str) -> Tuple[str, float, List[str]]:
-    """
-    Returns: (vendor, vendor_confidence, candidates)
-    """
     lines = [_clean_line(x) for x in (raw_text or "").splitlines()]
     lines = [ln for ln in lines if ln]
 
-    # Vendor is almost always near the top
     top = lines[:22]
 
-    # Candidate set includes merged adjacent short lines (split headers)
     candidates: List[str] = []
     for i, a in enumerate(top):
         if a:
@@ -169,7 +195,6 @@ def extract_vendor(raw_text: str) -> Tuple[str, float, List[str]]:
 
     best = _collapse_spaced_letters(scored[0][0]).strip()
 
-    # Build candidate list (top 3 unique)
     seen = set()
     cand_list = []
     for c, s in scored[:10]:
@@ -181,10 +206,8 @@ def extract_vendor(raw_text: str) -> Tuple[str, float, List[str]]:
         if len(cand_list) >= 3:
             break
 
-    # Confidence from score (bounded)
-    # Typical best score ~0.8–1.4
     conf = max(0.0, min(0.92, (scored[0][1] + 0.1)))
-    conf = float(max(0.25, conf))  # never claim super low if we picked a candidate
+    conf = float(max(0.25, conf))
 
     return (best, conf, cand_list)
 
@@ -195,7 +218,6 @@ def extract_vendor(raw_text: str) -> Tuple[str, float, List[str]]:
 def extract_date(raw_text: str) -> Tuple[str, float]:
     text = raw_text or ""
 
-    # Prefer ISO-like dates first
     m = DATE_YMD_RE.search(text)
     if m:
         try:
@@ -204,15 +226,12 @@ def extract_date(raw_text: str) -> Tuple[str, float]:
         except Exception:
             pass
 
-    # MM/DD/YYYY or MM-DD-YYYY
-    # Many receipts show date near top; take the first plausible
     for m in DATE_MDY_RE.finditer(text):
         mm, dd, yy = m.group(1), m.group(2), m.group(3)
         if len(yy) == 2:
             yy = "20" + yy
         try:
             dt = datetime(int(yy), int(mm), int(dd))
-            # sanity window: 2010–2035
             if 2010 <= dt.year <= 2035:
                 return (dt.strftime("%Y-%m-%d"), 0.85)
         except Exception:
@@ -222,70 +241,169 @@ def extract_date(raw_text: str) -> Tuple[str, float]:
 
 
 # -----------------------------
-# Amount extraction
+# Amount extraction (REDONE)
 # -----------------------------
-def _line_amounts(line: str) -> List[float]:
-    vals = []
-    for tok in MONEY_RE.findall(line or ""):
+def _extract_money_spans(line: str) -> List[Tuple[float, int, int, str]]:
+    """
+    Returns list of (value, start, end, raw_match_text).
+    Prefers 2-decimal matches; falls back to integers only if needed.
+    """
+    spans: List[Tuple[float, int, int, str]] = []
+
+    for m in MONEY_2DP_RE.finditer(line or ""):
+        raw = m.group(0)
+        tok = m.group(1)
         v = _parse_money_val(tok)
         if v is not None:
-            vals.append(v)
-    return vals
+            spans.append((float(v), m.start(), m.end(), raw))
+
+    # If no 2dp values at all, consider integers (rare receipts)
+    if not spans:
+        for m in MONEY_INT_RE.finditer(line or ""):
+            raw = m.group(0)
+            tok = m.group(1)
+            # avoid years / long ids
+            if len(tok.replace(",", "")) >= 5:
+                continue
+            v = _parse_money_val(tok)
+            if v is not None:
+                spans.append((float(v), m.start(), m.end(), raw))
+
+    return spans
+
+def _contains_any_key(norm_line: str, keys: List[str]) -> bool:
+    return any(k in norm_line for k in keys)
+
+def _is_excluded_amount_line(line: str) -> bool:
+    low = _norm(line)
+    return any(k in low for k in EXCLUDE_AMOUNT_KEYS)
+
+def _pick_best_value_from_line(line: str) -> Optional[float]:
+    """
+    Prefer the *rightmost* monetary value on the line (totals are usually last),
+    and strongly prefer values that include a currency marker somewhere on the line.
+    """
+    spans = _extract_money_spans(line)
+    if not spans:
+        return None
+
+    # If we have multiple values, totals are commonly the last number on the line.
+    # Example: "TOTAL 1.23 4.56 38.72" -> pick 38.72
+    spans_sorted = sorted(spans, key=lambda x: (x[1], x[2]))
+    return float(spans_sorted[-1][0])
 
 def extract_amount(raw_text: str) -> Tuple[float, float]:
     """
-    Strategy:
-      1) Look for strongest TOTAL-like lines and pick the best amount there
-      2) Otherwise, look for "TOTAL" lines (but exclude subtotal/tax/tip/change)
-      3) Otherwise, fallback to max amount near bottom quarter of receipt
+    More foolproof strategy (fixes gas receipts showing gallons/qty as "total"):
+
+    1) Build scored candidate lines from the *bottom half* of the receipt.
+       - Strongly favor lines containing TOTAL/AMOUNT/SALE TOTAL
+       - Strongly favor lines with a currency marker ($/USD)
+       - Strongly penalize unit-trap lines (gallons, qty, lbs, etc.) unless they also look like currency
+       - Exclude subtotal/tax/tip/change/etc.
+
+    2) Take the best line, then choose the *rightmost* money amount on that line.
+       (Not max(), because max() can pick the wrong thing on weird lines.)
     """
     lines = [_clean_line(x) for x in (raw_text or "").splitlines()]
     lines = [ln for ln in lines if ln]
     if not lines:
         return (0.0, 0.0)
 
-    # Weighted scan with priority for bottom area (totals usually lower)
     n = len(lines)
-    bottom_start = int(n * 0.55)
-    bottom = lines[bottom_start:] if n >= 8 else lines
+    bottom_start = int(n * 0.50) if n >= 10 else 0
+    search_lines = lines[bottom_start:]
 
-    def is_excluded_total_line(l: str) -> bool:
-        low = _norm(l)
-        return any(k in low for k in EXCLUDE_AMOUNT_KEYS)
-
-    # 1) Strong keys
-    for ln in bottom:
+    candidates: List[Tuple[float, float, str]] = []  # (score, value, line)
+    for idx, ln in enumerate(search_lines):
         low = _norm(ln)
-        if any(k in low for k in TOTAL_KEYS_STRONG) and not is_excluded_total_line(ln):
-            vals = _line_amounts(ln)
-            if vals:
-                return (float(max(vals)), 0.95)
-
-    # 2) Generic total lines, excluding traps
-    for ln in bottom:
-        low = _norm(ln)
-        if ("total" in low) and ("subtotal" not in low) and (not is_excluded_total_line(ln)):
-            vals = _line_amounts(ln)
-            if vals:
-                return (float(max(vals)), 0.88)
-
-    # 3) Fallback: max amount in bottom, excluding obvious traps like change/tender
-    fallback_vals = []
-    for ln in bottom:
-        if is_excluded_total_line(ln):
+        if not low:
             continue
-        fallback_vals.extend(_line_amounts(ln))
+        if _is_excluded_amount_line(ln):
+            continue
+
+        # must have some money-like number to consider
+        val = _pick_best_value_from_line(ln)
+        if val is None:
+            continue
+
+        score = 0.0
+
+        # Position bonus: closer to bottom = more likely
+        # idx goes 0..len(search_lines)-1
+        if len(search_lines) > 1:
+            score += 0.40 * (idx / (len(search_lines) - 1))
+
+        # Keyword bonuses
+        if _contains_any_key(low, TOTAL_KEYS_STRONG):
+            score += 1.30
+        elif _contains_any_key(low, TOTAL_KEYS_WEAK):
+            score += 0.55
+
+        # Currency marker bonus (this is the big fix for gallons/qty totals)
+        has_currency = _line_has_currency_marker(ln)
+        if has_currency:
+            score += 1.10
+        else:
+            score -= 0.25  # mild penalty; still allow if it's the only line
+
+        # Unit-trap penalty: "TOTAL GALLONS 38.72" should NOT win
+        if _line_has_unit_trap(ln):
+            # Only forgive if line clearly looks like currency
+            score -= (1.40 if not has_currency else 0.40)
+
+        # Extra nudge if line explicitly says "amount" or "grand total"
+        if "grand total" in low:
+            score += 0.50
+        if "amount" in low:
+            score += 0.35
+
+        # Penalize lines that look like they are describing unit price math
+        # (common in fuel: "$3.199/gal" + other numbers)
+        if "/gal" in low or "per gal" in low or "price/gal" in low:
+            score -= 0.25
+
+        candidates.append((score, float(val), ln))
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_val, _best_line = candidates[0]
+
+        # Confidence mapping
+        # If we had currency + strong key near bottom: very high
+        conf = 0.65
+        if best_score >= 2.2:
+            conf = 0.95
+        elif best_score >= 1.6:
+            conf = 0.88
+        elif best_score >= 1.1:
+            conf = 0.78
+        else:
+            conf = 0.68
+
+        return (float(best_val), float(conf))
+
+    # Fallback: pick max *dollar-looking* value from bottom, but avoid unit-trap lines first
+    fallback_vals: List[float] = []
+    for ln in search_lines:
+        if _is_excluded_amount_line(ln):
+            continue
+        if _line_has_unit_trap(ln) and not _line_has_currency_marker(ln):
+            continue
+        for v, *_ in _extract_money_spans(ln):
+            fallback_vals.append(float(v))
     if fallback_vals:
-        return (float(max(fallback_vals)), 0.70)
+        return (float(max(fallback_vals)), 0.60)
 
-    # 4) Last resort: max amount anywhere
-    all_vals = []
+    # Last resort: any value anywhere
+    all_vals: List[float] = []
     for ln in lines:
-        if is_excluded_total_line(ln):
+        if _is_excluded_amount_line(ln):
             continue
-        all_vals.extend(_line_amounts(ln))
+        for v, *_ in _extract_money_spans(ln):
+            all_vals.append(float(v))
     if all_vals:
-        return (float(max(all_vals)), 0.55)
+        return (float(max(all_vals)), 0.50)
 
     return (0.0, 0.0)
 
@@ -305,8 +423,6 @@ def extract_fields(raw_text: str) -> Dict:
     date, dconf = extract_date(raw_text)
     amount, acon = extract_amount(raw_text)
 
-    # Overall parse confidence: conservative
-    # Vendor + amount matter most for "first-time feels right"
     parse_conf = 0.0
     parse_conf += 0.45 * vconf
     parse_conf += 0.35 * acon
@@ -316,7 +432,6 @@ def extract_fields(raw_text: str) -> Dict:
         "vendor": vendor,
         "date": date,
         "amount": float(amount),
-        # extras (safe to ignore if your UI doesn't use them)
         "vendor_candidates": vcands,
         "vendor_confidence": float(vconf),
         "date_confidence": float(dconf),
