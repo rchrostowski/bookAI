@@ -27,6 +27,7 @@ from src.categorize import categorize
 
 st.set_page_config(page_title="BookIQ", page_icon="🧾", layout="wide")
 
+
 # -------------------------
 # Chart of Accounts (simple mapping)
 # -------------------------
@@ -51,8 +52,83 @@ def _utc_now() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 
+def _needs_review(vendor: str, date: str, amount: float, confidence: float) -> int:
+    vendor_ok = bool((vendor or "").strip())
+    date_ok = bool((date or "").strip())
+    amt_ok = float(amount or 0) > 0
+    # If any required field missing OR confidence low → needs review
+    if not (vendor_ok and date_ok and amt_ok):
+        return 1
+    if float(confidence or 0) < 0.72:
+        return 1
+    return 0
+
+
+def _safe_float(x, default=0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return float(default)
+
+
+def _safe_int(x, default=0) -> int:
+    try:
+        return int(float(x))
+    except Exception:
+        return int(default)
+
+
+def _make_df(rows):
+    df = pd.DataFrame(rows or [])
+    defaults = {
+        "id": "",
+        "date": "",
+        "created_at": "",
+        "vendor": "",
+        "amount": 0.0,
+        "category": "Other",
+        "account_code": "",
+        "job": "",
+        "notes": "",
+        "confidence": 0.0,
+        "needs_review": 0,
+        "deleted_at": "",
+        "receipt_path": "",
+    }
+    for col, default in defaults.items():
+        if col not in df.columns:
+            df[col] = default
+
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+    df["confidence"] = pd.to_numeric(df["confidence"], errors="coerce").fillna(0.0)
+    df["needs_review"] = pd.to_numeric(df["needs_review"], errors="coerce").fillna(0).astype(int)
+    df["date"] = df["date"].fillna("").astype(str)
+    df["vendor"] = df["vendor"].fillna("").astype(str)
+    df["category"] = df["category"].fillna("Other").astype(str)
+    df["job"] = df["job"].fillna("").astype(str)
+    df["notes"] = df["notes"].fillna("").astype(str)
+    return df
+
+
+def _duplicate_hint(df: pd.DataFrame, vendor: str, date: str, amount: float) -> pd.DataFrame:
+    """Simple duplicate detector: same vendor+date and amount within 1 cent."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    v = (vendor or "").strip().lower()
+    d = (date or "").strip()
+    a = float(amount or 0.0)
+    if not v or not d or a <= 0:
+        return pd.DataFrame()
+    tmp = df.copy()
+    tmp["_v"] = tmp["vendor"].fillna("").astype(str).str.strip().str.lower()
+    tmp["_d"] = tmp["date"].fillna("").astype(str).str.strip()
+    tmp["_a"] = pd.to_numeric(tmp["amount"], errors="coerce").fillna(0.0)
+    dup = tmp[(tmp["_v"] == v) & (tmp["_d"] == d) & (tmp["_a"].sub(a).abs() <= 0.01)]
+    return dup[["id", "date", "vendor", "amount", "category", "job"]].head(10)
+
+
 # -------------------------
-# Sidebar: Workspace
+# Sidebar: Workspace + quick stats
 # -------------------------
 with st.sidebar:
     st.title("🧾 BookIQ")
@@ -82,13 +158,84 @@ if not st.session_state.get("ws_code"):
 WS_DIR = workspace_dir(st.session_state["ws_code"])
 MEM = load_memory(WS_DIR)
 
+# Load rows once per run (and reuse everywhere)
+ROWS = list_txns(WS_DIR, include_deleted=False)
+DF = _make_df(ROWS)
+
 st.title("BookIQ")
 st.caption("Simple, accountant-friendly receipt capture for small businesses.")
 
-# ✅ IMPORTANT: tab_privacy is defined here so it exists later
-tab_upload, tab_review, tab_browse, tab_reports, tab_export, tab_deleted, tab_privacy = st.tabs(
-    ["1) Upload", "2) Needs review", "3) Browse", "4) Reports", "5) Export", "Recently deleted", "Privacy"]
+# Tabs (includes the missing “umph” stuff: dashboard + bulk tools)
+tab_dash, tab_upload, tab_review, tab_browse, tab_reports, tab_export, tab_deleted, tab_privacy = st.tabs(
+    ["0) Dashboard", "1) Upload", "2) Needs review", "3) Browse", "4) Reports", "5) Export", "Recently deleted", "Privacy"]
 )
+
+# ==========================================================
+# 0) DASHBOARD (the “umph”)
+# ==========================================================
+with tab_dash:
+    st.header("Dashboard")
+
+    if DF.empty:
+        st.info("No receipts yet. Go to **Upload** to add your first one.")
+    else:
+        # High-level stats
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        this_month = today[:7]
+
+        total_spend = float(DF["amount"].sum())
+        month_spend = float(DF[DF["date"].astype(str).str.startswith(this_month)]["amount"].sum())
+        needs_review_ct = int(DF["needs_review"].sum())
+        receipt_ct = int(len(DF))
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total spend", f"${total_spend:,.2f}")
+        c2.metric("This month", f"${month_spend:,.2f}")
+        c3.metric("Receipts", f"{receipt_ct}")
+        c4.metric("Needs review", f"{needs_review_ct}")
+
+        st.divider()
+
+        left, right = st.columns([1.2, 0.8], gap="large")
+
+        with left:
+            st.subheader("Top categories (all time)")
+            cat = (
+                DF.groupby("category", dropna=False)["amount"]
+                .sum()
+                .sort_values(ascending=False)
+                .reset_index()
+            )
+            st.dataframe(cat, use_container_width=True, hide_index=True)
+
+            st.subheader("Spend over time")
+            tmp = DF.copy()
+            tmp["month"] = tmp["date"].astype(str).str.slice(0, 7)
+            trend = tmp.groupby("month")["amount"].sum().sort_index()
+            st.line_chart(trend, height=240)
+
+        with right:
+            st.subheader("Top vendors (all time)")
+            vend = (
+                DF.groupby("vendor", dropna=False)["amount"]
+                .sum()
+                .sort_values(ascending=False)
+                .reset_index()
+            )
+            vend = vend[vend["vendor"].astype(str).str.strip() != ""].head(12)
+            st.dataframe(vend, use_container_width=True, hide_index=True)
+
+            st.subheader("Quick actions")
+            qa1, qa2 = st.columns(2)
+            with qa1:
+                if st.button("Jump to Needs review", type="primary"):
+                    st.session_state["active_tab"] = "review"
+                    st.rerun()
+            with qa2:
+                if st.button("Build Accountant Pack"):
+                    csv_bytes, zip_bytes = build_accountant_pack(WS_DIR)
+                    st.download_button("Download CSV", data=csv_bytes, file_name="bookiq_export.csv", mime="text/csv")
+                    st.download_button("Download Receipts ZIP", data=zip_bytes, file_name="receipts.zip", mime="application/zip")
 
 # ==========================================================
 # 1) UPLOAD
@@ -104,7 +251,7 @@ with tab_upload:
     else:
         file_bytes = up.getvalue()
 
-        # Run OCR once per file to avoid re-running on every Streamlit rerun
+        # OCR caching per file
         key = f"ocr::{up.name}::{len(file_bytes)}"
         if st.session_state.get("ocr_key") != key:
             preview_img, raw_text = ocr_upload(up.name, file_bytes)
@@ -117,16 +264,16 @@ with tab_upload:
 
         fields = extract_fields(raw_text) if raw_text else {"vendor": "", "date": "", "amount": 0.0}
 
-        vendor = (fields.get("vendor") or "").strip()
-        date = (fields.get("date") or "").strip()
-        amount = float(fields.get("amount") or 0.0)
+        vendor0 = (fields.get("vendor") or "").strip()
+        date0 = (fields.get("date") or "").strip()
+        amount0 = _safe_float(fields.get("amount"), 0.0)
 
-        suggestion = categorize(raw_text, vendor=vendor, memory=MEM)
-        category = suggestion.get("category", "Other")
-        confidence = float(suggestion.get("confidence", 0.35))
-        reasons = suggestion.get("reasons", [])
+        suggestion = categorize(raw_text, vendor=vendor0, memory=MEM) if raw_text else {"category": "Other", "confidence": 0.0, "reasons": []}
+        category0 = suggestion.get("category", "Other")
+        confidence0 = _safe_float(suggestion.get("confidence"), 0.35)
+        reasons0 = suggestion.get("reasons", [])
 
-        account_code, account_name = coa_for_category(category)
+        account_code0, account_name0 = coa_for_category(category0)
 
         colA, colB = st.columns([1, 1], gap="large")
 
@@ -136,12 +283,28 @@ with tab_upload:
                 st.image(preview_img, use_container_width=True)
             with st.expander("OCR text (debug)"):
                 st.code(raw_text if raw_text else "(No OCR text extracted)")
+            with st.expander("Parse diagnostics"):
+                st.write(
+                    {
+                        "vendor_confidence": fields.get("vendor_confidence"),
+                        "date_confidence": fields.get("date_confidence"),
+                        "amount_confidence": fields.get("amount_confidence"),
+                        "parse_confidence": fields.get("parse_confidence"),
+                        "vendor_candidates": fields.get("vendor_candidates"),
+                    }
+                )
 
         with colB:
             st.subheader("Extracted fields (editable)")
-            vendor = st.text_input("Vendor", value=vendor)
-            date = st.text_input("Date (YYYY-MM-DD)", value=date)
-            amount = st.number_input("Total amount", min_value=0.0, value=float(amount), step=0.01)
+            vendor = st.text_input("Vendor", value=vendor0)
+            date = st.text_input("Date (YYYY-MM-DD)", value=date0)
+            amount = st.number_input("Total amount", min_value=0.0, value=float(amount0), step=0.01)
+
+            # Duplicate warning
+            dup = _duplicate_hint(DF, vendor, date, amount)
+            if not dup.empty:
+                st.warning("⚠️ Possible duplicate detected (same vendor/date/amount).")
+                st.dataframe(dup, use_container_width=True, hide_index=True)
 
             known_jobs = get_known_jobs(MEM)
             job_pick = st.selectbox("Job (optional)", [""] + known_jobs, index=0)
@@ -155,15 +318,19 @@ with tab_upload:
             category = st.selectbox(
                 "Category",
                 options=list(COA.keys()),
-                index=list(COA.keys()).index(category) if category in COA else list(COA.keys()).index("Other"),
+                index=list(COA.keys()).index(category0) if category0 in COA else list(COA.keys()).index("Other"),
             )
             account_code, account_name = coa_for_category(category)
             st.caption(f"Account: **{account_code} — {account_name}**")
 
-            st.metric("AI confidence", f"{int(confidence * 100)}%")
-            if reasons:
+            st.metric("AI confidence", f"{int(confidence0 * 100)}%")
+            if reasons0:
                 st.caption("Why:")
-                st.write("• " + "\n• ".join(reasons))
+                st.write("• " + "\n• ".join(reasons0))
+
+            needs_review_flag = _needs_review(vendor, date, amount, confidence0)
+            if needs_review_flag:
+                st.info("This will be marked **Needs review** until required fields are filled and/or confidence improves.")
 
             if st.button("Save receipt", type="primary"):
                 add_txn(
@@ -173,13 +340,31 @@ with tab_upload:
                     amount=float(amount),
                     category=category,
                     account_code=account_code,
-                    confidence=confidence,
-                    confidence_notes="; ".join(reasons),
+                    confidence=confidence0,
+                    confidence_notes="; ".join(reasons0) if isinstance(reasons0, list) else str(reasons0),
                     job=job,
                     notes=notes,
                     receipt_bytes=file_bytes,
                     receipt_filename=up.name,
                 )
+
+                # Best-effort: immediately set needs_review correctly if storage defaults are weird
+                # (Some storage layers compute it; this ensures correctness if not.)
+                # We need the latest rows to find the newest id — if storage assigns id.
+                try:
+                    latest = list_txns(WS_DIR, include_deleted=False)
+                    if latest:
+                        last = latest[-1]
+                        update_txn(
+                            WS_DIR,
+                            last["id"],
+                            {
+                                "needs_review": needs_review_flag,
+                                "updated_at": _utc_now(),
+                            },
+                        )
+                except Exception:
+                    pass
 
                 if job:
                     remember_job(MEM, job)
@@ -187,6 +372,7 @@ with tab_upload:
                 save_memory(WS_DIR, MEM)
 
                 st.success("Saved ✅")
+                st.rerun()
 
 # ==========================================================
 # 2) NEEDS REVIEW
@@ -195,22 +381,58 @@ with tab_review:
     st.header("Needs review")
 
     rows = list_txns(WS_DIR, include_deleted=False)
-    review = [r for r in rows if int(r.get("needs_review") or 0) == 1]
+    df = _make_df(rows)
+    review = df[df["needs_review"] == 1].copy()
 
-    if not review:
+    if review.empty:
         st.success("Nothing needs review 🎉")
     else:
         st.write("These receipts need a quick check (missing fields or low confidence).")
 
-        for r in review[:200]:
+        # Bulk tools (the “umph”)
+        st.subheader("Bulk actions")
+        ids = review["id"].astype(str).tolist()
+        bulk_ids = st.multiselect("Select receipt IDs", options=ids, default=[])
+        b1, b2, b3 = st.columns([1, 1, 1])
+        with b1:
+            if st.button("Bulk approve selected", type="primary") and bulk_ids:
+                for _id in bulk_ids:
+                    update_txn(WS_DIR, _id, {"needs_review": 0, "approved_at": _utc_now(), "updated_at": _utc_now()})
+                st.success(f"Approved {len(bulk_ids)} ✅")
+                st.rerun()
+        with b2:
+            if st.button("Bulk delete selected") and bulk_ids:
+                for _id in bulk_ids:
+                    soft_delete_txn(WS_DIR, _id)
+                st.warning(f"Moved {len(bulk_ids)} to Recently deleted 🗑️")
+                st.rerun()
+        with b3:
+            if st.button("Recompute needs_review for ALL"):
+                for r in rows:
+                    nr = _needs_review(r.get("vendor", ""), r.get("date", ""), _safe_float(r.get("amount"), 0.0), _safe_float(r.get("confidence"), 0.0))
+                    update_txn(WS_DIR, r["id"], {"needs_review": nr, "updated_at": _utc_now()})
+                st.success("Recomputed ✅")
+                st.rerun()
+
+        st.divider()
+
+        # Individual review cards
+        for r in review.head(200).to_dict(orient="records"):
             with st.container(border=True):
                 c1, c2, c3 = st.columns([2, 2, 1])
 
                 with c1:
-                    st.markdown(f"**{r.get('vendor','(missing vendor)')}**")
+                    st.markdown(f"**{r.get('vendor','(missing vendor)') or '(missing vendor)'}**")
                     st.caption(f"ID: {r['id']} • Confidence: {float(r.get('confidence') or 0):.2f}")
                     st.write(f"Date: `{r.get('date','')}`  |  Amount: **${float(r.get('amount') or 0):.2f}**")
                     st.write(f"Category: `{r.get('category','Other')}`  |  Account: `{r.get('account_code','')}`")
+
+                    # Receipt preview
+                    receipt_path = (r.get("receipt_path") or "").strip()
+                    p = WS_DIR / receipt_path if receipt_path else None
+                    if p and p.exists():
+                        with st.expander("Show receipt image"):
+                            st.image(str(p), use_container_width=True)
 
                 with c2:
                     new_vendor = st.text_input("Vendor", value=r.get("vendor", ""), key=f"rv_{r['id']}")
@@ -228,7 +450,7 @@ with tab_review:
                         options=list(COA.keys()),
                         index=list(COA.keys()).index(r.get("category", "Other"))
                         if r.get("category", "Other") in COA
-                        else 0,
+                        else list(COA.keys()).index("Other"),
                         key=f"rc_{r['id']}",
                     )
                     code, _ = coa_for_category(new_cat)
@@ -244,6 +466,7 @@ with tab_review:
 
                 with c3:
                     if st.button("Approve", type="primary", key=f"ap_{r['id']}"):
+                        new_needs_review = _needs_review(new_vendor, new_date, float(new_amount), max(float(r.get("confidence") or 0), 0.90))
                         update_txn(
                             WS_DIR,
                             r["id"],
@@ -257,7 +480,8 @@ with tab_review:
                                 "notes": new_notes,
                                 "approved_at": _utc_now(),
                                 "confidence": max(float(r.get("confidence") or 0), 0.90),
-                                "needs_review": 0,
+                                "needs_review": new_needs_review,
+                                "updated_at": _utc_now(),
                             },
                         )
 
@@ -281,32 +505,11 @@ with tab_browse:
     st.header("Browse receipts")
 
     rows = list_txns(WS_DIR, include_deleted=False)
-    if not rows:
+    df = _make_df(rows)
+
+    if df.empty:
         st.info("No receipts yet.")
     else:
-        df = pd.DataFrame(rows)
-
-        defaults = {
-            "id": "",
-            "date": "",
-            "created_at": "",
-            "vendor": "",
-            "amount": 0.0,
-            "category": "Other",
-            "account_code": "",
-            "job": "",
-            "notes": "",
-            "confidence": 0.0,
-            "needs_review": 0,
-        }
-        for col, default in defaults.items():
-            if col not in df.columns:
-                df[col] = default
-
-        df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
-        df["confidence"] = pd.to_numeric(df["confidence"], errors="coerce").fillna(0.0)
-        df["needs_review"] = pd.to_numeric(df["needs_review"], errors="coerce").fillna(0).astype(int)
-
         jobs = sorted([j for j in df["job"].fillna("").unique().tolist() if str(j).strip()])
         vendors = sorted([v for v in df["vendor"].fillna("").unique().tolist() if str(v).strip()])
         cats = sorted(df["category"].fillna("Other").unique().tolist())
@@ -345,7 +548,6 @@ with tab_browse:
                     str(r.get("category", "")),
                 ]).lower()
                 return q in blob
-
             view = view[view.apply(_hit, axis=1)]
 
         st.caption(f"{len(view)} receipts shown")
@@ -356,11 +558,46 @@ with tab_browse:
         if sort_cols:
             view = view.sort_values(by=sort_cols, ascending=[False] * len(sort_cols), na_position="last")
 
+        # Bulk edit (umph)
+        st.subheader("Bulk edit")
+        bulk_ids = st.multiselect("Select IDs from the table to bulk edit", options=view["id"].astype(str).tolist(), default=[])
+        bcol1, bcol2, bcol3, bcol4 = st.columns([1, 1, 1, 1])
+        with bcol1:
+            bulk_cat = st.selectbox("Set category", options=["(no change)"] + list(COA.keys()))
+        with bcol2:
+            bulk_job = st.text_input("Set job", value="", placeholder="(leave blank for no change)")
+        with bcol3:
+            bulk_notes_append = st.text_input("Append note", value="", placeholder="(optional)")
+        with bcol4:
+            if st.button("Apply bulk changes", type="primary") and bulk_ids:
+                for _id in bulk_ids:
+                    patch = {"updated_at": _utc_now()}
+                    if bulk_cat != "(no change)":
+                        code, _ = coa_for_category(bulk_cat)
+                        patch["category"] = bulk_cat
+                        patch["account_code"] = code
+                    if (bulk_job or "").strip():
+                        patch["job"] = bulk_job.strip()
+                        remember_job(MEM, bulk_job.strip())
+                    if (bulk_notes_append or "").strip():
+                        # simple append
+                        old = df[df["id"].astype(str) == str(_id)]["notes"].iloc[0] if not df[df["id"].astype(str) == str(_id)].empty else ""
+                        patch["notes"] = (str(old) + " " + bulk_notes_append.strip()).strip()
+                    update_txn(WS_DIR, _id, patch)
+                save_memory(WS_DIR, MEM)
+                st.success(f"Updated {len(bulk_ids)} receipts ✅")
+                st.rerun()
+
+        st.divider()
+
         left, right = st.columns([1.2, 0.8], gap="large")
 
         with left:
             st.dataframe(view[show_cols], use_container_width=True, hide_index=True)
-            selected_id = st.text_input("Open receipt by ID (copy from table)", value=st.session_state.get("selected_id", ""))
+            selected_id = st.text_input(
+                "Open receipt by ID (copy from table)",
+                value=st.session_state.get("selected_id", "")
+            )
             st.session_state["selected_id"] = selected_id.strip()
 
         with right:
@@ -369,14 +606,14 @@ with tab_browse:
             if not sel:
                 st.info("Paste an ID to view/edit.")
             else:
-                rec_map = {r["id"]: r for r in rows}
-                r = rec_map.get(sel)
+                rec_map = {str(r["id"]): r for r in rows}
+                r = rec_map.get(str(sel))
                 if not r:
                     st.warning("ID not found (or deleted).")
                 else:
-                    receipt_path = r.get("receipt_path") or ""
-                    p = WS_DIR / receipt_path
-                    if receipt_path and p.exists():
+                    receipt_path = (r.get("receipt_path") or "").strip()
+                    p = WS_DIR / receipt_path if receipt_path else None
+                    if p and p.exists():
                         st.image(str(p), use_container_width=True)
                     else:
                         st.caption("Receipt image not found.")
@@ -388,7 +625,7 @@ with tab_browse:
                     ec = st.selectbox(
                         "Category",
                         options=list(COA.keys()),
-                        index=list(COA.keys()).index(r.get("category", "Other")) if r.get("category", "Other") in COA else 0,
+                        index=list(COA.keys()).index(r.get("category", "Other")) if r.get("category", "Other") in COA else list(COA.keys()).index("Other"),
                         key=f"ec_{sel}",
                     )
                     code, _ = coa_for_category(ec)
@@ -406,6 +643,10 @@ with tab_browse:
                     c1, c2 = st.columns(2)
                     with c1:
                         if st.button("Save changes", type="primary", key=f"save_{sel}"):
+                            # keep original confidence unless you change your pipeline later
+                            conf = _safe_float(r.get("confidence"), 0.0)
+                            nr = _needs_review(ev, ed, float(ea), conf)
+
                             update_txn(WS_DIR, sel, {
                                 "vendor": ev,
                                 "date": ed,
@@ -415,7 +656,7 @@ with tab_browse:
                                 "job": ej,
                                 "notes": en,
                                 "updated_at": _utc_now(),
-                                "needs_review": 0 if (ev.strip() and ed.strip() and float(ea) > 0) else 1,
+                                "needs_review": nr,
                             })
                             if ej:
                                 remember_job(MEM, ej)
@@ -439,21 +680,18 @@ with tab_reports:
     st.header("Reports")
 
     rows = list_txns(WS_DIR, include_deleted=False)
-    if not rows:
+    df = _make_df(rows)
+
+    if df.empty:
         st.info("No receipts yet.")
     else:
-        df = pd.DataFrame(rows)
-        for col, default in [("date", ""), ("category", "Other"), ("amount", 0.0)]:
-            if col not in df.columns:
-                df[col] = default
-
-        df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
         df["month"] = df["date"].astype(str).str.slice(0, 7)
-
         pnl = df.pivot_table(index="month", columns="category", values="amount", aggfunc="sum", fill_value=0).sort_index()
 
         st.subheader("Monthly expense summary (P&L-style)")
         st.dataframe(pnl, use_container_width=True)
+
+        # “umph”: toggle between total line + category stack table
         st.line_chart(pnl.sum(axis=1), height=220)
 
         st.download_button(
@@ -485,11 +723,7 @@ with tab_deleted:
     if not deleted:
         st.info("No deleted receipts.")
     else:
-        ddf = pd.DataFrame(deleted)
-        for col, default in [("amount", 0.0), ("deleted_at", ""), ("vendor", ""), ("date", ""), ("category", "Other"), ("job", "")]:
-            if col not in ddf.columns:
-                ddf[col] = default
-        ddf["amount"] = pd.to_numeric(ddf["amount"], errors="coerce").fillna(0.0)
+        ddf = _make_df(deleted)
 
         st.dataframe(
             ddf[["id", "date", "vendor", "amount", "category", "job", "deleted_at"]],
@@ -616,12 +850,9 @@ You are always in control of your data:
 
 If this policy changes, the updated version will always be available inside the app.
 Continued use of BookIQ implies acceptance of the current policy.
-
----
-
-
 """
     )
+
 
 
 
