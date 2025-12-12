@@ -1,68 +1,66 @@
 from __future__ import annotations
 
-import io
-from typing import Tuple
+from io import BytesIO
+from typing import Tuple, Optional
 
-import fitz  # PyMuPDF
-import numpy as np
-import cv2
 from PIL import Image
 import pytesseract
 
 
-def _pdf_first_page_to_pil(pdf_bytes: bytes, zoom: float = 2.0) -> Image.Image:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc.load_page(0)
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
-    return img
-
-
-def _preprocess_for_ocr(pil_img: Image.Image) -> Image.Image:
+def ocr_upload(filename: str, file_bytes: bytes) -> Tuple[Optional[Image.Image], str]:
     """
-    Strong receipt-friendly preprocessing:
-    - grayscale
-    - denoise
-    - adaptive threshold
+    Returns:
+      (preview_image, extracted_text)
+
+    Guaranteed behavior:
+    - For images: always attempts OCR
+    - For PDFs: returns clear message instead of empty text
+    - Never crashes Streamlit Cloud
     """
-    img = np.array(pil_img)
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    gray = cv2.bilateralFilter(gray, 9, 75, 75)
 
-    thr = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31, 10
-    )
-    return Image.fromarray(thr).convert("RGB")
+    name = (filename or "").lower()
 
+    # -----------------------
+    # PDF handling (cloud-safe)
+    # -----------------------
+    if name.endswith(".pdf"):
+        return None, (
+            "PDF detected.\n"
+            "PDF OCR is disabled on Streamlit Cloud.\n"
+            "Please upload a photo (JPG or PNG) of the receipt."
+        )
 
-def _tesseract_ocr(pil_img: Image.Image) -> str:
-    config = "--oem 3 --psm 6"
+    # -----------------------
+    # Image OCR
+    # -----------------------
     try:
-        return pytesseract.image_to_string(pil_img, config=config) or ""
+        img = Image.open(BytesIO(file_bytes)).convert("RGB")
     except Exception:
-        return ""
+        return None, "Could not read image file."
 
+    # Resize very large images (improves OCR reliability)
+    max_side = max(img.size)
+    if max_side > 2000:
+        scale = 2000 / max_side
+        img = img.resize(
+            (int(img.size[0] * scale), int(img.size[1] * scale)),
+            Image.LANCZOS,
+        )
 
-def ocr_upload(file_name: str, file_bytes: bytes) -> Tuple[Image.Image, str]:
-    """
-    Returns (preview_image, raw_text)
-    - Images: OCR directly
-    - PDFs: render first page -> OCR
-    """
-    lower = (file_name or "").lower()
+    # OCR config tuned for receipts
+    config = "--psm 6"
 
-    if lower.endswith(".pdf"):
-        pil_img = _pdf_first_page_to_pil(file_bytes)
-    else:
-        pil_img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    try:
+        text = pytesseract.image_to_string(img, config=config)
+    except Exception as e:
+        return img, f"OCR error: {e}"
 
-    pre = _preprocess_for_ocr(pil_img)
-    text = _tesseract_ocr(pre)
-    return pre, text
+    text = (text or "").strip()
+
+    if not text:
+        return img, "OCR ran but did not detect text. Try a clearer photo."
+
+    return img, text
 
 
 
