@@ -1,152 +1,80 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Tuple
+from typing import Dict
 
+from src.memory import get_vendor_mapping
 
-# -------------------------
-# Category keyword rules
-# -------------------------
-
-CATEGORY_RULES: Dict[str, Dict[str, List[str]]] = {
-    "Fuel": {
-        "vendor": [
-            "shell", "exxon", "bp", "chevron", "sunoco", "mobil",
-            "citgo", "wawa", "speedway", "marathon"
-        ],
-        "text": [
-            "fuel", "gas", "unleaded", "diesel", "pump", "gallon"
-        ],
-    },
-    "Meals": {
-        "vendor": [
-            "starbucks", "dunkin", "coffee", "cafe", "grill",
-            "restaurant", "bistro", "kitchen", "bar", "pizza"
-        ],
-        "text": [
-            "coffee", "latte", "espresso", "bagel", "sandwich",
-            "burger", "fries", "meal", "food", "drink", "soda"
-        ],
-    },
-    "Materials / Supplies": {
-        "vendor": [
-            "home depot", "lowe", "ace hardware", "menards"
-        ],
-        "text": [
-            "lumber", "mulch", "concrete", "pipe", "paint",
-            "supply", "supplies", "hardware", "materials"
-        ],
-    },
-    "Tools & Equipment": {
-        "vendor": [
-            "harbor freight", "grainger", "fastenal"
-        ],
-        "text": [
-            "tool", "drill", "saw", "equipment", "ladder",
-            "compressor", "generator"
-        ],
-    },
-    "Vehicle Maintenance": {
-        "vendor": [
-            "autozone", "advanced auto", "jiffy lube", "pep boys"
-        ],
-        "text": [
-            "oil change", "tire", "brake", "alignment",
-            "maintenance", "service"
-        ],
-    },
-    "Office / Admin": {
-        "vendor": [
-            "staples", "office depot", "ups", "fedex"
-        ],
-        "text": [
-            "paper", "printer", "ink", "shipping", "postage",
-            "admin", "office"
-        ],
-    },
-    "Subcontractors": {
-        "vendor": [],
-        "text": [
-            "labor", "contractor", "subcontractor", "install",
-            "installation", "service fee"
-        ],
-    },
-    "Permits / Fees": {
-        "vendor": [],
-        "text": [
-            "permit", "license", "inspection", "city fee", "county"
-        ],
-    },
+KEYWORDS = {
+    "Fuel": ["gas", "fuel", "shell", "exxon", "chevron", "bp", "sunoco", "wawa"],
+    "Meals": ["restaurant", "cafe", "coffee", "diner", "pizza", "grill", "bar", "taco"],
+    "Materials / Supplies": ["supply", "supplies", "hardware", "lumber", "home depot", "lowe", "ace", "tools"],
+    "Tools & Equipment": ["drill", "saw", "tool", "equipment", "battery", "charger"],
+    "Vehicle Maintenance": ["oil", "tire", "auto", "repair", "mechanic", "service", "inspection"],
+    "Office / Admin": ["software", "subscription", "office", "paper", "printer", "internet", "phone"],
+    "Subcontractors": ["subcontract", "1099", "labor", "installer"],
+    "Permits / Fees": ["permit", "license", "fee", "registration"],
 }
 
+TOTAL_WORDS = ["total", "amount due", "balance due", "grand total", "total due"]
 
-ALL_CATEGORIES = ["All"] + list(CATEGORY_RULES.keys()) + ["Other"]
-
-
-# -------------------------
-# Helpers
-# -------------------------
-
-def _normalize(text: str) -> str:
-    return re.sub(r"[^a-z0-9 ]+", " ", (text or "").lower())
-
-
-def _count_hits(haystack: str, needles: List[str]) -> int:
-    return sum(1 for n in needles if n in haystack)
-
-
-# -------------------------
-# Public API
-# -------------------------
-
-def all_categories() -> List[str]:
-    return ALL_CATEGORIES
-
-
-def categorize(raw_text: str, vendor: str = "") -> Tuple[str, float]:
+def categorize(raw_text: str, vendor: str = "", memory: Dict | None = None, coa: Dict | None = None) -> Dict:
     """
-    Returns (category, confidence)
-
-    Confidence logic (simple & explainable):
-    - Vendor hit = strong signal
-    - Text keyword hits = medium signal
-    - Confidence scaled to max ~0.95
+    Returns:
+      { "category": str, "confidence": float, "reasons": [str] }
     """
+    text = (raw_text or "").lower()
+    v = (vendor or "").lower()
 
-    text = _normalize(raw_text)
-    vendor_norm = _normalize(vendor)
+    reasons = []
+    score = 0.0
 
-    best_category = "Other"
-    best_score = 0
+    # 1) Vendor memory (strongest signal)
+    if memory is not None and vendor:
+        vm = get_vendor_mapping(memory, vendor)
+        if vm and vm.get("category"):
+            reasons.append("Matched saved vendor rule")
+            return {"category": vm["category"], "confidence": 0.95, "reasons": reasons}
 
-    for category, rules in CATEGORY_RULES.items():
-        score = 0
+    # 2) Presence of TOTAL label
+    if any(t in text for t in TOTAL_WORDS):
+        score += 0.25
+        reasons.append("Found TOTAL label")
+    else:
+        reasons.append("No clear TOTAL label")
 
-        # Vendor match (very strong)
-        if vendor_norm:
-            score += 3 * _count_hits(vendor_norm, rules["vendor"])
+    # 3) Date-like pattern
+    if re.search(r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b", text) or re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2}|\d{4})\b", text):
+        score += 0.20
+        reasons.append("Found date pattern")
+    else:
+        reasons.append("No clear date pattern")
 
-        # OCR text keyword matches
-        score += _count_hits(text, rules["text"])
+    # 4) Keyword scoring
+    best_cat = "Other"
+    best_hits = 0
 
-        if score > best_score:
-            best_score = score
-            best_category = category
+    blob = (v + "\n" + text).lower()
 
-    # -------------------------
-    # Confidence scaling
-    # -------------------------
+    for cat, kws in KEYWORDS.items():
+        hits = 0
+        for kw in kws:
+            if kw in blob:
+                hits += 1
+        if hits > best_hits:
+            best_hits = hits
+            best_cat = cat
 
-    if best_score == 0:
-        # No useful signal
-        return "Other", 0.25
+    if best_hits > 0:
+        score += min(0.45, 0.15 * best_hits)
+        reasons.append(f"Keyword match for {best_cat} ({best_hits} hit(s))")
+    else:
+        reasons.append("No strong keyword match → Other")
 
-    # Score → confidence mapping
-    # 1 hit  → ~0.55
-    # 2 hits → ~0.70
-    # 3 hits → ~0.85
-    # 4+     → ~0.95
-    confidence = min(0.95, 0.40 + 0.15 * best_score)
+    # 5) Final confidence shaping
+    # baseline
+    conf = max(0.35, min(0.90, score + 0.20))
 
-    return best_category, round(confidence, 2)
+    return {"category": best_cat, "confidence": float(conf), "reasons": reasons}
+
 
