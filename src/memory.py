@@ -12,31 +12,26 @@ def _path(ws_dir: Path) -> Path:
 def load_memory(ws_dir: Path) -> Dict:
     p = _path(ws_dir)
     if not p.exists():
-        return {
-            "vendor_map": {},   # vendor_norm -> {"category":..., "account_code":...}
-            "jobs": [],         # list of known jobs
-        }
+        return {"vendor_map": {}, "jobs": []}
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return {"vendor_map": {}, "jobs": []}
 
 def save_memory(ws_dir: Path, mem: Dict) -> None:
-    p = _path(ws_dir)
-    p.write_text(json.dumps(mem, indent=2), encoding="utf-8")
+    _path(ws_dir).write_text(json.dumps(mem, indent=2), encoding="utf-8")
 
 def _norm_vendor(v: str) -> str:
-    return "".join(ch.lower() for ch in (v or "").strip() if ch.isalnum() or ch in [" ", "-"]).strip()
+    v = (v or "").strip().lower()
+    v = "".join(ch for ch in v if ch.isalnum() or ch in [" ", "-"])
+    return " ".join(v.split())
 
 def remember_vendor_mapping(mem: Dict, vendor: str, category: str, account_code: str) -> None:
     v = _norm_vendor(vendor)
     if not v:
         return
     mem.setdefault("vendor_map", {})
-    mem["vendor_map"][v] = {
-        "category": category or "Other",
-        "account_code": account_code or "",
-    }
+    mem["vendor_map"][v] = {"category": category or "Other", "account_code": account_code or ""}
 
 def get_vendor_mapping(mem: Dict, vendor: str):
     v = _norm_vendor(vendor)
@@ -53,3 +48,4 @@ def remember_job(mem: Dict, job: str) -> None:
 
 def get_known_jobs(mem: Dict) -> List[str]:
     return sorted([j for j in (mem or {}).get("jobs", []) if str(j).strip()])
+
