@@ -56,7 +56,6 @@ def _needs_review(vendor: str, date: str, amount: float, confidence: float) -> i
     vendor_ok = bool((vendor or "").strip())
     date_ok = bool((date or "").strip())
     amt_ok = float(amount or 0) > 0
-    # If any required field missing OR confidence low → needs review
     if not (vendor_ok and date_ok and amt_ok):
         return 1
     if float(confidence or 0) < 0.72:
@@ -69,13 +68,6 @@ def _safe_float(x, default=0.0) -> float:
         return float(x)
     except Exception:
         return float(default)
-
-
-def _safe_int(x, default=0) -> int:
-    try:
-        return int(float(x))
-    except Exception:
-        return int(default)
 
 
 def _make_df(rows):
@@ -111,7 +103,6 @@ def _make_df(rows):
 
 
 def _duplicate_hint(df: pd.DataFrame, vendor: str, date: str, amount: float) -> pd.DataFrame:
-    """Simple duplicate detector: same vendor+date and amount within 1 cent."""
     if df is None or df.empty:
         return pd.DataFrame()
     v = (vendor or "").strip().lower()
@@ -128,7 +119,40 @@ def _duplicate_hint(df: pd.DataFrame, vendor: str, date: str, amount: float) -> 
 
 
 # -------------------------
-# Sidebar: Workspace + quick stats
+# Money saved model (the missing “umph”)
+# -------------------------
+# Assumptions (editable in sidebar):
+# - Accountant cleanup hourly rate
+# - Minutes per receipt if messy vs organized
+DEFAULT_HOURLY_RATE = 85.0
+DEFAULT_MIN_MESSY = 4.0
+DEFAULT_MIN_CLEAN = 0.75
+
+
+def _estimate_money_saved(receipt_count: int, hourly_rate: float, min_messy: float, min_clean: float):
+    """
+    Estimate time + money saved by organizing receipts in BookIQ.
+
+    receipt_count: number of receipts processed
+    hourly_rate: accountant hourly rate
+    min_messy: minutes per receipt if you hand them a mess
+    min_clean: minutes per receipt if BookIQ exports clean CSV/ZIP
+    """
+    receipt_count = int(receipt_count or 0)
+    hourly_rate = float(hourly_rate or 0)
+    min_messy = float(min_messy or 0)
+    min_clean = float(min_clean or 0)
+
+    messy_hours = (receipt_count * min_messy) / 60.0
+    clean_hours = (receipt_count * min_clean) / 60.0
+    hours_saved = max(0.0, messy_hours - clean_hours)
+    dollars_saved = max(0.0, hours_saved * hourly_rate)
+
+    return messy_hours, clean_hours, hours_saved, dollars_saved
+
+
+# -------------------------
+# Sidebar: Workspace + assumptions
 # -------------------------
 with st.sidebar:
     st.title("🧾 BookIQ")
@@ -151,6 +175,15 @@ with st.sidebar:
         "4) Export CSV + receipts ZIP for your accountant\n"
     )
 
+    st.divider()
+    st.markdown("### Money saved (assumptions)")
+    hourly_rate = st.number_input("Accountant hourly rate ($/hr)", min_value=0.0, value=float(st.session_state.get("hourly_rate", DEFAULT_HOURLY_RATE)), step=5.0)
+    min_messy = st.number_input("Minutes/receipt if messy", min_value=0.0, value=float(st.session_state.get("min_messy", DEFAULT_MIN_MESSY)), step=0.25)
+    min_clean = st.number_input("Minutes/receipt with BookIQ", min_value=0.0, value=float(st.session_state.get("min_clean", DEFAULT_MIN_CLEAN)), step=0.25)
+    st.session_state["hourly_rate"] = float(hourly_rate)
+    st.session_state["min_messy"] = float(min_messy)
+    st.session_state["min_clean"] = float(min_clean)
+
 if not st.session_state.get("ws_code"):
     st.info("Enter a **workspace code** in the sidebar to begin.")
     st.stop()
@@ -158,20 +191,18 @@ if not st.session_state.get("ws_code"):
 WS_DIR = workspace_dir(st.session_state["ws_code"])
 MEM = load_memory(WS_DIR)
 
-# Load rows once per run (and reuse everywhere)
 ROWS = list_txns(WS_DIR, include_deleted=False)
 DF = _make_df(ROWS)
 
 st.title("BookIQ")
 st.caption("Simple, accountant-friendly receipt capture for small businesses.")
 
-# Tabs (includes the missing “umph” stuff: dashboard + bulk tools)
 tab_dash, tab_upload, tab_review, tab_browse, tab_reports, tab_export, tab_deleted, tab_privacy = st.tabs(
     ["0) Dashboard", "1) Upload", "2) Needs review", "3) Browse", "4) Reports", "5) Export", "Recently deleted", "Privacy"]
 )
 
 # ==========================================================
-# 0) DASHBOARD (the “umph”)
+# 0) DASHBOARD
 # ==========================================================
 with tab_dash:
     st.header("Dashboard")
@@ -179,7 +210,6 @@ with tab_dash:
     if DF.empty:
         st.info("No receipts yet. Go to **Upload** to add your first one.")
     else:
-        # High-level stats
         today = datetime.utcnow().strftime("%Y-%m-%d")
         this_month = today[:7]
 
@@ -188,11 +218,30 @@ with tab_dash:
         needs_review_ct = int(DF["needs_review"].sum())
         receipt_ct = int(len(DF))
 
-        c1, c2, c3, c4 = st.columns(4)
+        # Money saved calcs
+        hourly_rate = float(st.session_state.get("hourly_rate", DEFAULT_HOURLY_RATE))
+        min_messy = float(st.session_state.get("min_messy", DEFAULT_MIN_MESSY))
+        min_clean = float(st.session_state.get("min_clean", DEFAULT_MIN_CLEAN))
+        messy_hours, clean_hours, hours_saved, dollars_saved = _estimate_money_saved(receipt_ct, hourly_rate, min_messy, min_clean)
+
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Total spend", f"${total_spend:,.2f}")
         c2.metric("This month", f"${month_spend:,.2f}")
         c3.metric("Receipts", f"{receipt_ct}")
         c4.metric("Needs review", f"{needs_review_ct}")
+        c5.metric("Est. money saved", f"${dollars_saved:,.0f}")
+
+        with st.expander("How 'money saved' is estimated"):
+            st.write(
+                f"""
+- Receipts processed: **{receipt_ct}**
+- Assumed accountant rate: **${hourly_rate:.0f}/hr**
+- If messy: **{min_messy:.2f} min/receipt** → **{messy_hours:.2f} hrs**
+- With BookIQ: **{min_clean:.2f} min/receipt** → **{clean_hours:.2f} hrs**
+- Estimated time saved: **{hours_saved:.2f} hrs**
+- Estimated money saved: **${dollars_saved:,.2f}**
+"""
+            )
 
         st.divider()
 
@@ -251,7 +300,6 @@ with tab_upload:
     else:
         file_bytes = up.getvalue()
 
-        # OCR caching per file
         key = f"ocr::{up.name}::{len(file_bytes)}"
         if st.session_state.get("ocr_key") != key:
             preview_img, raw_text = ocr_upload(up.name, file_bytes)
@@ -272,8 +320,6 @@ with tab_upload:
         category0 = suggestion.get("category", "Other")
         confidence0 = _safe_float(suggestion.get("confidence"), 0.35)
         reasons0 = suggestion.get("reasons", [])
-
-        account_code0, account_name0 = coa_for_category(category0)
 
         colA, colB = st.columns([1, 1], gap="large")
 
@@ -300,7 +346,6 @@ with tab_upload:
             date = st.text_input("Date (YYYY-MM-DD)", value=date0)
             amount = st.number_input("Total amount", min_value=0.0, value=float(amount0), step=0.01)
 
-            # Duplicate warning
             dup = _duplicate_hint(DF, vendor, date, amount)
             if not dup.empty:
                 st.warning("⚠️ Possible duplicate detected (same vendor/date/amount).")
@@ -348,9 +393,6 @@ with tab_upload:
                     receipt_filename=up.name,
                 )
 
-                # Best-effort: immediately set needs_review correctly if storage defaults are weird
-                # (Some storage layers compute it; this ensures correctness if not.)
-                # We need the latest rows to find the newest id — if storage assigns id.
                 try:
                     latest = list_txns(WS_DIR, include_deleted=False)
                     if latest:
@@ -389,7 +431,6 @@ with tab_review:
     else:
         st.write("These receipts need a quick check (missing fields or low confidence).")
 
-        # Bulk tools (the “umph”)
         st.subheader("Bulk actions")
         ids = review["id"].astype(str).tolist()
         bulk_ids = st.multiselect("Select receipt IDs", options=ids, default=[])
@@ -416,7 +457,6 @@ with tab_review:
 
         st.divider()
 
-        # Individual review cards
         for r in review.head(200).to_dict(orient="records"):
             with st.container(border=True):
                 c1, c2, c3 = st.columns([2, 2, 1])
@@ -427,7 +467,6 @@ with tab_review:
                     st.write(f"Date: `{r.get('date','')}`  |  Amount: **${float(r.get('amount') or 0):.2f}**")
                     st.write(f"Category: `{r.get('category','Other')}`  |  Account: `{r.get('account_code','')}`")
 
-                    # Receipt preview
                     receipt_path = (r.get("receipt_path") or "").strip()
                     p = WS_DIR / receipt_path if receipt_path else None
                     if p and p.exists():
@@ -466,7 +505,6 @@ with tab_review:
 
                 with c3:
                     if st.button("Approve", type="primary", key=f"ap_{r['id']}"):
-                        new_needs_review = _needs_review(new_vendor, new_date, float(new_amount), max(float(r.get("confidence") or 0), 0.90))
                         update_txn(
                             WS_DIR,
                             r["id"],
@@ -480,7 +518,7 @@ with tab_review:
                                 "notes": new_notes,
                                 "approved_at": _utc_now(),
                                 "confidence": max(float(r.get("confidence") or 0), 0.90),
-                                "needs_review": new_needs_review,
+                                "needs_review": 0,
                                 "updated_at": _utc_now(),
                             },
                         )
@@ -558,38 +596,6 @@ with tab_browse:
         if sort_cols:
             view = view.sort_values(by=sort_cols, ascending=[False] * len(sort_cols), na_position="last")
 
-        # Bulk edit (umph)
-        st.subheader("Bulk edit")
-        bulk_ids = st.multiselect("Select IDs from the table to bulk edit", options=view["id"].astype(str).tolist(), default=[])
-        bcol1, bcol2, bcol3, bcol4 = st.columns([1, 1, 1, 1])
-        with bcol1:
-            bulk_cat = st.selectbox("Set category", options=["(no change)"] + list(COA.keys()))
-        with bcol2:
-            bulk_job = st.text_input("Set job", value="", placeholder="(leave blank for no change)")
-        with bcol3:
-            bulk_notes_append = st.text_input("Append note", value="", placeholder="(optional)")
-        with bcol4:
-            if st.button("Apply bulk changes", type="primary") and bulk_ids:
-                for _id in bulk_ids:
-                    patch = {"updated_at": _utc_now()}
-                    if bulk_cat != "(no change)":
-                        code, _ = coa_for_category(bulk_cat)
-                        patch["category"] = bulk_cat
-                        patch["account_code"] = code
-                    if (bulk_job or "").strip():
-                        patch["job"] = bulk_job.strip()
-                        remember_job(MEM, bulk_job.strip())
-                    if (bulk_notes_append or "").strip():
-                        # simple append
-                        old = df[df["id"].astype(str) == str(_id)]["notes"].iloc[0] if not df[df["id"].astype(str) == str(_id)].empty else ""
-                        patch["notes"] = (str(old) + " " + bulk_notes_append.strip()).strip()
-                    update_txn(WS_DIR, _id, patch)
-                save_memory(WS_DIR, MEM)
-                st.success(f"Updated {len(bulk_ids)} receipts ✅")
-                st.rerun()
-
-        st.divider()
-
         left, right = st.columns([1.2, 0.8], gap="large")
 
         with left:
@@ -643,7 +649,6 @@ with tab_browse:
                     c1, c2 = st.columns(2)
                     with c1:
                         if st.button("Save changes", type="primary", key=f"save_{sel}"):
-                            # keep original confidence unless you change your pipeline later
                             conf = _safe_float(r.get("confidence"), 0.0)
                             nr = _needs_review(ev, ed, float(ea), conf)
 
@@ -690,8 +695,6 @@ with tab_reports:
 
         st.subheader("Monthly expense summary (P&L-style)")
         st.dataframe(pnl, use_container_width=True)
-
-        # “umph”: toggle between total line + category stack table
         st.line_chart(pnl.sum(axis=1), height=220)
 
         st.download_button(
