@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+
 TRANSACTIONS_CSV = "transactions.csv"
 
 
@@ -22,7 +23,6 @@ def _csv_path(ws_dir: Path) -> Path:
 def _fieldnames() -> List[str]:
     return [
         "id",
-        "group_id",
         "date",
         "vendor",
         "amount",
@@ -104,12 +104,11 @@ def add_txn(
     category: str,
     account_code: str,
     confidence: float,
-    confidence_notes: str = "",
-    job: str = "",
-    notes: str = "",
+    confidence_notes: str,
+    job: str,
+    notes: str,
     receipt_bytes: bytes,
     receipt_filename: str,
-    group_id: str = "",
 ) -> str:
     ensure_store(ws_dir)
 
@@ -127,7 +126,6 @@ def add_txn(
 
     row = {
         "id": txn_id,
-        "group_id": group_id or "",
         "date": (date or "").strip(),
         "vendor": (vendor or "").strip(),
         "amount": float(amount),
@@ -171,7 +169,6 @@ def update_txn(ws_dir: Path, txn_id: str, patch: Dict) -> None:
     _write_all(ws_dir, rows)
 
 
-# ✅ THESE ARE THE FUNCTIONS YOUR APP IMPORTS
 def soft_delete_txn(ws_dir: Path, txn_id: str) -> None:
     rows = _read_all(ws_dir)
     for r in rows:
@@ -244,9 +241,8 @@ def build_accountant_pack(ws_dir: Path) -> Tuple[bytes, bytes]:
             cat = (r.get("category") or "Other").replace("/", "-")
             dest = f"{month}/{cat}/{src.name}"
             z.write(src, dest)
-    zip_bytes = zip_buf.getvalue()
 
-    return csv_bytes, zip_bytes
+    return csv_bytes, zip_buf.getvalue()
 
 
 def build_monthly_pnl_csv(pnl_df) -> bytes:
